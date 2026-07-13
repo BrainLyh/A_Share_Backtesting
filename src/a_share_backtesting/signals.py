@@ -62,3 +62,31 @@ def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     )
     data["signal_strength"] = (data["j"] - prior_j).fillna(0) + (data["volume"] / data["volume_ma"]).fillna(0)
     return data
+
+
+def build_signal_variants(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """Add frozen event-study variants and their first-in-run trigger markers."""
+    data = build_signals(frame, config)
+    groups = data.groupby("code", sort=False)
+    prior_bbi = groups["bbi"].shift(1)
+    prior_j = groups["j"].shift(1)
+    prior_pit_seen = groups["j"].transform(
+        lambda values: values.shift(1).rolling(int(config["pit_lookback"]), min_periods=1).min()
+    ) < float(config["j_threshold"])
+    trend = (data["close"] > data["bbi"]) & (data["bbi"] > prior_bbi)
+
+    data["legacy_signal"] = data["legacy_pullback_signal"]
+    data["bbi_signal"] = data["legacy_signal"] & trend
+    data["b1_signal"] = (
+        data["eligible"]
+        & trend
+        & (data["dif"] > 0)
+        & prior_pit_seen
+        & (data["j"] > prior_j)
+        & (data["close"] > data["open"])
+        & (data["volume"] >= data["volume_ma"] * float(config["volume_multiplier"]))
+    )
+    for variant in ("legacy", "bbi", "b1"):
+        previous = groups[f"{variant}_signal"].shift(1).fillna(False).astype(bool)
+        data[f"{variant}_first_trigger"] = data[f"{variant}_signal"] & ~previous
+    return data
