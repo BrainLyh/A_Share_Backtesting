@@ -9,10 +9,14 @@
 ## 工作状态
 
 - 开发分支：`codex/b1-event-study`
+- 工作树：`C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study`
+- 基线提交：`06c3899`（`chore: establish B1 event study baseline`）
 - 实施计划：[docs/superpowers/plans/2026-07-13-b1-event-study.md](docs/superpowers/plans/2026-07-13-b1-event-study.md)
 - 已完成：清理此前连续组合回测路径；保留指标、信号基础和最小测试。
 - 已验证：`python -m unittest discover -s tests -v`，2 项通过。
-- 未开始：实施计划 Task 1（数据契约与冻结实验配置）。
+- 已完成：Task 1（数据契约与冻结实验配置），提交 `29f9e8d`。
+- 验证：`python -m unittest discover -s tests -v`，7 项通过。
+- 进行中：Task 2（`legacy`、`bbi`、`b1` 信号变体与首次触发标记）。
 
 ## 已确定的研究口径
 
@@ -24,9 +28,9 @@
 
 ## 下一步
 
-1. 在隔离工作树中执行 Task 1。
-2. 创建 `data_contract.py`、`event_study_default.json` 与对应单元测试。
-3. 通过测试后提交，并在本文件中写入提交号与下一任务。
+1. 为现有指标和选股逻辑增加三个可审计信号变体。
+2. 编写连续信号去重和 BBI/B1 定义的单元测试。
+3. 通过全量测试后提交，并在本文件中写入提交号与 Task 3。
 
 ## 跨机器续作
 
