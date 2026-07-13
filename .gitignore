@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.worktrees/
+outputs/
+data/*.csv
+!data/daily_bars_template.csv

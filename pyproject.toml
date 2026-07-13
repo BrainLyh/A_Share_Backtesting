@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-share-b1-backtesting"
+version = "0.1.0"
+description = "Daily A-share B1 pullback strategy research backtester"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2.0", "pandas>=2.2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

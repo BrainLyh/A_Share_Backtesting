@@ -1,0 +1,2 @@
+date,code,name,open,high,low,close,volume,market_cap,is_st,is_suspended,in_core_pool,upper_limit,lower_limit
+2024-01-02,600000,示例股票,10.00,10.20,9.90,10.10,1000000,12000000000,false,false,true,11.11,9.09

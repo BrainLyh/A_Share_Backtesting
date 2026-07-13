@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import pandas as pd
+
+from .indicators import add_grouped_indicators
+
+
+MAIN_BOARD_PREFIXES = ("600", "601", "603", "605", "000", "001", "002")
+
+
+def _as_bool(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+
+
+def _main_board(code: pd.Series) -> pd.Series:
+    return code.astype(str).str.zfill(6).str.startswith(MAIN_BOARD_PREFIXES)
+
+
+def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    data = add_grouped_indicators(frame)
+    data["code"] = data["code"].astype(str).str.zfill(6)
+    data["is_st"] = _as_bool(data["is_st"])
+    data["is_suspended"] = _as_bool(data["is_suspended"])
+    data["in_core_pool"] = _as_bool(data["in_core_pool"])
+    name_is_st = data["name"].fillna("").astype(str).str.contains(r"\*?ST", flags=re.IGNORECASE, regex=True)
+    eligibility = _main_board(data["code"]) & ~data["is_st"] & ~name_is_st
+    eligibility &= data["market_cap"] > float(config["min_market_cap"])
+    if config["require_core_pool"]:
+        eligibility &= data["in_core_pool"]
+    data["eligible"] = eligibility
+
+    prior_volume = data.groupby("code", sort=False)["volume"].shift(1)
+    prior_bbi = data.groupby("code", sort=False)["bbi"].shift(1)
+    prior_j = data.groupby("code", sort=False)["j"].shift(1)
+    prior_close = data.groupby("code", sort=False)["close"].shift(1)
+    prior_k = data.groupby("code", sort=False)["k"].shift(1)
+    prior_d = data.groupby("code", sort=False)["d"].shift(1)
+    pit_seen = data.groupby("code", sort=False)["j"].transform(
+        lambda values: values.rolling(int(config["pit_lookback"]), min_periods=1).min()
+    ) < float(config["j_threshold"])
+
+    data["legacy_pullback_signal"] = (
+        eligibility
+        & (data["j"] < float(config["j_threshold"]))
+        & (data["dif"] > 0)
+        & (data["volume"] < prior_volume)
+    )
+    trend = (data["close"] > data["bbi"]) & (data["bbi"] > prior_bbi)
+    j_turns_up = (data["j"] > prior_j) & pit_seen
+    right_side = (
+        (data["close"] > data["open"])
+        & (data["volume"] >= data["volume_ma"] * float(config["volume_multiplier"]))
+        & ((prior_close <= prior_bbi) | (data["close"] > data["bbi"]))
+    )
+    data["b1_entry_signal"] = eligibility & trend & j_turns_up & right_side & (data["dif"] > 0)
+    data["b1_exit_signal"] = (
+        ((data["close"] < data["bbi"]) & (prior_close >= prior_bbi))
+        | ((data["j"] >= 85) & (data["k"] < data["d"]) & (prior_k >= prior_d))
+    )
+    data["signal_strength"] = (data["j"] - prior_j).fillna(0) + (data["volume"] / data["volume_ma"]).fillna(0)
+    return data
