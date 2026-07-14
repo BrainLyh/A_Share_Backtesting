@@ -2,6 +2,14 @@
 
 本项目当前只验证技术信号的历史统计有效性，不做连续持仓或自动交易。
 
+## 工作目录
+
+本项目的真实开发 worktree 位于：
+
+`C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study`
+
+请在该目录运行测试、CLI 和 Git 命令。`C:\Users\playd\Desktop\A_Share_Backtesting` 根目录保留 `main` checkout、`.worktrees/`、`data/` 和 `outputs/`，不作为本分支的直接开发目录。
+
 第一阶段比较三组日线收盘信号：
 
 - `legacy`：原通达信缩量回撤公式；

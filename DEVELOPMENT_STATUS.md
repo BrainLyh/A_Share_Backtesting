@@ -15,20 +15,20 @@
 - 流式 CLI 初稿已补齐七类研究产物：`signal_audit.csv`、`events.csv`、`date_portfolios.csv`、`summary.csv`、`control_distribution.csv`、`control_summary.json`、`report.md`，并额外写出 `streaming_metadata.json` 和 `control_candidates.csv`。
 - 已用 6 个真实通达信 `.day` 样本文件试跑：原始 1000 次控制迭代配置 15.667 秒完成，输出 12 个 `variant + horizon` 组合各 1000 行控制分布；样本元数据为 3 个有效窗口代码、4,713 行信号审计、737 个候选对照事件。
 - 已诊断此前“长时间无输出”的主要可复现原因之一：随机对照抽样在迭代内反复筛选 DataFrame；现已改为预先按 `variant + horizon + signal_date` 建候选池索引。
-- 已新增流式 CLI 进度汇报：参数 `--progress-interval-seconds` 默认 60 秒，控制台输出 `progress {...}`，同时写入 `progress.jsonl`；`streaming_metadata.json` 记录 `total_elapsed_seconds` 与 `stage_durations_seconds`。
+- 已新增流式 CLI 进度汇报：参数 `--progress-interval-seconds` 默认 60 秒，控制台输出 `progress {...}`，同时写入 `progress.jsonl`；`streaming_metadata.json` 记录 `total_elapsed_seconds` 与 `stage_durations_seconds`。`df4decc` 已同步到真实开发 worktree `C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study`。
 
 ## 当前未提交状态与阻塞点
 
-- 今日源码、测试与开发记录准备提交为一个进度提交；提交后本地不应保留未提交代码变更。
+- 当前代码变更已提交为 `df4decc`，并同步到真实开发 worktree；本次仅补充目录说明与进度记录后提交、推送。
 - `data/daily_bars_technical.metadata.json` 是本地研究数据；保持忽略，不提交。
 - 本轮发现并停止了一个残留全量流式 CLI 进程和一个样本长跑进程；当前不应再依赖此前 `outputs/event_study_technical_2026h1` 的任何半成品。
 - 真实全量 3,439 个目标主板文件尚未重新跑完；不能将真实回测视为已完成，也不能提交或推送为最终结果。
 
 ## 下一步执行顺序
 
-1. 运行 `git status --short`，确认仅保留上述未提交源码、测试、文档和本地研究数据，不覆盖任何改动。
+1. 在真实开发 worktree `C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study` 运行 `git status --short`，确认工作区 clean。
 2. 再次确认没有残留 `streaming_event_study_run` 进程。
-3. 运行全量真实数据 CLI：`--source C:\Users\playd\Desktop\A_Share_Backtesting\data\tdx_raw --config config\event_study_technical_only.json --output outputs\event_study_technical_2026h1 --progress-interval-seconds 60`。
+3. 在真实开发 worktree 运行全量真实数据 CLI：`--source C:\Users\playd\Desktop\A_Share_Backtesting\data\tdx_raw --config config\event_study_technical_only.json --output outputs\event_study_technical_2026h1 --progress-interval-seconds 60`。
 4. 记录退出码、耗时、产物存在性、事件数、12 个组合的控制分布行数、`streaming_metadata.json` 和进程/内存证据。
 5. 全量产物完整且审计通过后，再更新本文件、提交源码和文档、推送 `codex/b1-event-study`。
 
@@ -41,7 +41,7 @@
 ## 工作状态
 
 - 开发分支：`codex/b1-event-study`
-- 当前工作树：随机器而变；以分支 `codex/b1-event-study` 和本文件的提交号为准。
+- 当前工作树：`C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study`；不要在 `C:\Users\playd\Desktop\A_Share_Backtesting` 根目录或 `C:\Users\playd\Documents\A_share_backtesting` 继续本分支开发。
 - 基线提交：`06c3899`（`chore: establish B1 event study baseline`）
 - 实施计划：[docs/superpowers/plans/2026-07-13-b1-event-study.md](docs/superpowers/plans/2026-07-13-b1-event-study.md)
 - 已完成：清理此前连续组合回测路径；保留指标、信号基础和最小测试。
@@ -74,7 +74,7 @@
 
 ## 跨机器续作
 
-1. 切换到 `codex/b1-event-study` 分支，并同步该分支的最新提交。
+1. 进入 `C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study`，确认当前分支为 `codex/b1-event-study` 并同步该分支的最新提交。
 2. 先阅读本文件和实施计划；不要从 `main` 直接继续开发。
 3. 设置运行环境后执行：
 
