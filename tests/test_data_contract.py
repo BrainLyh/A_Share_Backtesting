@@ -6,7 +6,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from a_share_backtesting.data_contract import normalize_daily_bars, validate_event_config
+from a_share_backtesting.data_contract import (
+    normalize_daily_bars,
+    validate_event_config,
+    validate_technical_only_config,
+)
 
 
 def minimum_frame() -> pd.DataFrame:
@@ -64,6 +68,15 @@ class TestDataContract(unittest.TestCase):
         config = baseline_config() | {"horizons": [2, 0]}
         with self.assertRaisesRegex(ValueError, "horizons"):
             validate_event_config(config)
+
+    def test_technical_only_scope_rejects_a_positive_market_cap_filter(self):
+        config = baseline_config() | {
+            "data_scope_label": "technical_only_no_historical_market_cap_or_st",
+            "price_adjustment": "unadjusted",
+            "min_market_cap": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "min_market_cap"):
+            validate_technical_only_config(config)
 
 
 if __name__ == "__main__":

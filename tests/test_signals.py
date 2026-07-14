@@ -58,6 +58,14 @@ class TestSignalVariants(unittest.TestCase):
         result = build_signal_variants(rising_mainboard_bars(), baseline_config())
         self.assertTrue({"legacy_first_trigger", "bbi_first_trigger", "b1_first_trigger"}.issubset(result.columns))
 
+    def test_zero_market_cap_threshold_does_not_filter_technical_only_rows(self):
+        bars = rising_mainboard_bars()
+        bars["market_cap"] = 0
+
+        result = build_signal_variants(bars, baseline_config() | {"min_market_cap": 0})
+
+        self.assertTrue(result["eligible"].any())
+
 
 if __name__ == "__main__":
     unittest.main()

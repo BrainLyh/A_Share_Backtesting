@@ -22,6 +22,7 @@ REQUIRED_BAR_COLUMNS = {
 }
 PRICE_COLUMNS = ("open", "high", "low", "close")
 ALLOWED_VARIANTS = {"legacy", "bbi", "b1"}
+TECHNICAL_ONLY_SCOPE = "technical_only_no_historical_market_cap_or_st"
 
 
 def normalize_daily_bars(frame: pd.DataFrame, require_core_pool: bool) -> pd.DataFrame:
@@ -89,3 +90,13 @@ def validate_event_config(config: dict[str, Any]) -> None:
         value = config[key]
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{key} must be positive")
+
+
+def validate_technical_only_config(config: dict[str, Any]) -> None:
+    """Reject filters that cannot be supported by imported technical-only bars."""
+    if config.get("data_scope_label") != TECHNICAL_ONLY_SCOPE:
+        return
+    if config.get("min_market_cap") != 0:
+        raise ValueError("technical-only data requires min_market_cap to be 0")
+    if config.get("price_adjustment") != "unadjusted":
+        raise ValueError("technical-only data requires price_adjustment to be unadjusted")

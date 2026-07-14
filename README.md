@@ -24,3 +24,14 @@ $env:PYTHONPATH = "$PWD\src"
 输入应在首个分析日前保留至少 120 个交易日的预热数据，并覆盖最后一个信号日之后最长持有期及退出日。当前基线不要求历史主线池；只有提供逐日、无未来信息的 `in_core_pool` 后，才可声称验证了完整六步法。
 
 开发计划见 [B1 Signal Event Study Implementation Plan](docs/superpowers/plans/2026-07-13-b1-event-study.md)。尚未接入真实历史数据，也尚未生成策略表现结论。
+
+## 通达信日线技术条件版
+
+当只有通达信 `.day` 日线、没有逐日市值和 ST 状态时，先运行技术条件版：
+
+```powershell
+& $py -m a_share_backtesting.tdx_import --source C:\Users\playd\Desktop\A_Share_Backtesting\data\tdx_raw --output data\daily_bars_technical.csv --metadata data\daily_bars_technical.metadata.json
+& $py -m a_share_backtesting.event_study_run --data data\daily_bars_technical.csv --config config\event_study_technical_only.json --metadata data\daily_bars_technical.metadata.json --output outputs\event_study_technical_2026h1
+```
+
+该版本仅保留沪深主板代码及技术信号，价格使用未复权日线；需在分析起点前保留至少 120 个交易日预热数据。它不验证历史市值大于 100 亿或非 ST 过滤，亦不推断停牌状态。

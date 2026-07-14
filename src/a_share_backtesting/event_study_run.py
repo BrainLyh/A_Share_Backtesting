@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data_contract import normalize_daily_bars, validate_event_config
+from .data_contract import normalize_daily_bars, validate_event_config, validate_technical_only_config
 from .event_study import measure_events
 from .signals import build_signal_variants
 from .statistics import random_control_test, summarize_by_signal_date, summarize_events
@@ -16,6 +16,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the A-share B1 signal event study.")
     parser.add_argument("--data", required=True, help="Local daily-bars CSV")
     parser.add_argument("--config", required=True, help="Frozen experiment JSON")
+    parser.add_argument("--metadata", help="Optional import metadata JSON")
     parser.add_argument("--output", required=True, help="Output directory")
     return parser
 
@@ -38,6 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     validate_event_config(config)
+    validate_technical_only_config(config)
+    metadata = json.loads(Path(args.metadata).read_text(encoding="utf-8")) if args.metadata else None
     bars = normalize_daily_bars(pd.read_csv(args.data, dtype={"code": str}), bool(config.get("require_core_pool", False)))
     signals = build_signal_variants(bars, config)
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
@@ -64,6 +67,19 @@ def main(argv: list[str] | None = None) -> int:
     _write_csv(pd.concat(distributions, ignore_index=True), output / "control_distribution.csv")
     (output / "control_summary.json").write_text(json.dumps(control_summaries, ensure_ascii=False, indent=2), encoding="utf-8")
     report = ["# B1 信号事件研究报告", "", f"- 分析区间：{start.date()} 至 {end.date()}", "- 交易约定：信号日收盘后确认，下一交易日开盘入场；持有期结束后下一开盘退出。", "- 提醒：结果是日线研究模拟，未还原盘中成交顺序和涨跌停排队。", "", "## 汇总结果", "", _markdown_table(pd.concat(summaries, ignore_index=True))]
+    if metadata is not None:
+        report.extend(
+            [
+                "",
+                "## Input data scope",
+                f"- Scope: {metadata.get('data_scope_label', 'unspecified')}",
+                f"- Coverage: {metadata.get('date_start', 'unspecified')} to {metadata.get('date_end', 'unspecified')}",
+                f"- Price adjustment: {metadata.get('price_adjustment', 'unspecified')}",
+                f"- Field limitations: {', '.join(metadata.get('field_limitations', [])) or 'none'}",
+            ]
+        )
+        if metadata.get("data_scope_label") == "technical_only_no_historical_market_cap_or_st":
+            report.append("- This is a technical-only study and does not validate historical market-cap or ST filters.")
     (output / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     return 0
 

@@ -27,7 +27,9 @@ def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     data["in_core_pool"] = _as_bool(data["in_core_pool"])
     name_is_st = data["name"].fillna("").astype(str).str.contains(r"\*?ST", flags=re.IGNORECASE, regex=True)
     eligibility = _main_board(data["code"]) & ~data["is_st"] & ~name_is_st
-    eligibility &= data["market_cap"] > float(config["min_market_cap"])
+    min_market_cap = float(config["min_market_cap"])
+    if min_market_cap > 0:
+        eligibility &= data["market_cap"] > min_market_cap
     if config["require_core_pool"]:
         eligibility &= data["in_core_pool"]
     data["eligible"] = eligibility

@@ -74,11 +74,14 @@ class TestEventStudy(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parents[1]) as directory:
             bars_path = Path(directory) / "bars.csv"
             config_path = Path(directory) / "config.json"
+            metadata_path = Path(directory) / "metadata.json"
             output_path = Path(directory) / "output"
             pd.DataFrame(rows).to_csv(bars_path, index=False)
             config_path.write_text(json.dumps(config), encoding="utf-8")
-            self.assertEqual(main(["--data", str(bars_path), "--config", str(config_path), "--output", str(output_path)]), 0)
+            metadata_path.write_text(json.dumps({"data_scope_label": "technical_only_no_historical_market_cap_or_st", "date_start": "2020-01-01", "date_end": "2026-07-13", "price_adjustment": "unadjusted", "field_limitations": ["historical_market_cap_unavailable"]}), encoding="utf-8")
+            self.assertEqual(main(["--data", str(bars_path), "--config", str(config_path), "--metadata", str(metadata_path), "--output", str(output_path)]), 0)
             self.assertTrue({"signal_audit.csv", "events.csv", "date_portfolios.csv", "summary.csv", "control_distribution.csv", "control_summary.json", "report.md"}.issubset({path.name for path in output_path.iterdir()}))
+            self.assertIn("historical_market_cap_unavailable", (output_path / "report.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
