@@ -4,4 +4,5 @@ __pycache__/
 .worktrees/
 outputs/
 data/*.csv
+data/*.metadata.json
 !data/daily_bars_template.csv

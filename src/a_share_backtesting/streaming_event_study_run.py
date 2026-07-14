@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+from .data_contract import validate_event_config, validate_technical_only_config
+from .statistics import summarize_by_signal_date, summarize_events
+from .streaming_event_study import count_tdx_mainboard_files, collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
+from .signals import build_signal_variants
+
+
+STAGE_ORDER = {
+    "signal_audit": 0,
+    "signal_events": 1,
+    "control_events": 2,
+    "sampling_and_writing": 3,
+}
+
+
+class ProgressReporter:
+    def __init__(self, path: Path, total_files: int, interval_seconds: float, stream: object | None = None) -> None:
+        self.path = path
+        self.total_files = total_files
+        self.interval_seconds = max(0.0, interval_seconds)
+        self.stream = sys.stdout if stream is None else stream
+        self.started_at = time.monotonic()
+        self.last_emit_at: float | None = None
+        self.stage_started_at: dict[str, float] = {}
+        self.stage_durations_seconds: dict[str, float] = {}
+        self.path.write_text("", encoding="utf-8")
+
+    def update(
+        self,
+        stage: str,
+        processed_files: int = 0,
+        processed_code_windows: int = 0,
+        event_count: int | None = None,
+        candidate_event_count: int | None = None,
+        force: bool = False,
+        done: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        self.stage_started_at.setdefault(stage, now)
+        if not force and self.last_emit_at is not None and now - self.last_emit_at < self.interval_seconds:
+            return
+        self.last_emit_at = now
+        elapsed_seconds = now - self.started_at
+        if done:
+            self.stage_durations_seconds[stage] = round(now - self.stage_started_at[stage], 3)
+        stage_percent = 100.0 if done else (100.0 if self.total_files == 0 else min(100.0, processed_files / self.total_files * 100.0))
+        stage_index = STAGE_ORDER[stage]
+        overall_percent = 100.0 if done and stage_index == len(STAGE_ORDER) - 1 else min(100.0, (stage_index + stage_percent / 100.0) / len(STAGE_ORDER) * 100.0)
+        eta_seconds = None
+        if 0.0 < overall_percent < 100.0:
+            eta_seconds = elapsed_seconds * (100.0 / overall_percent - 1.0)
+        record: dict[str, object] = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "stage": stage,
+            "stage_percent": round(stage_percent, 2),
+            "overall_percent": round(overall_percent, 2),
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "eta_seconds": round(eta_seconds, 3) if eta_seconds is not None else None,
+            "processed_files": processed_files,
+            "total_files": self.total_files,
+            "processed_code_windows": processed_code_windows,
+        }
+        if event_count is not None:
+            record["event_count"] = event_count
+        if candidate_event_count is not None:
+            record["candidate_event_count"] = candidate_event_count
+        line = json.dumps(record, ensure_ascii=False)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        print(f"progress {line}", file=self.stream, flush=True)
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "total_elapsed_seconds": round(time.monotonic() - self.started_at, 3),
+            "stage_durations_seconds": dict(self.stage_durations_seconds),
+        }
+
+
+def _write_csv(frame: pd.DataFrame, path: Path) -> None:
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _markdown_table(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return "No filled events."
+    columns = [str(column) for column in frame.columns]
+    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join(["---"] * len(columns)) + " |"]
+    for row in frame.itertuples(index=False, name=None):
+        lines.append("| " + " | ".join(str(value) for value in row) + " |")
+    return "\n".join(lines)
+
+
+def _write_signal_audit(source: Path, config: dict[str, object], output_path: Path, progress_reporter: ProgressReporter | None = None) -> tuple[int, int]:
+    start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
+    columns = ["date", "code", "name", "eligible"] + [f"{variant}_first_trigger" for variant in config["variants"]]
+    wrote_header = False
+    row_count = 0
+    latest_yielded_count = 0
+    def progress_callback(scanned_count: int, yielded_count: int) -> None:
+        nonlocal latest_yielded_count
+        latest_yielded_count = yielded_count
+        if progress_reporter is not None:
+            progress_reporter.update("signal_audit", scanned_count, yielded_count, event_count=row_count)
+
+    for bars in iter_tdx_mainboard_bars(source, start, end, progress_callback=progress_callback):
+        signals = build_signal_variants(bars, config)
+        audit = signals.loc[signals["date"].between(start, end), [column for column in columns if column in signals.columns]].copy()
+        if audit.empty:
+            continue
+        audit.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False, encoding="utf-8-sig")
+        wrote_header = True
+        row_count += len(audit)
+    if not wrote_header:
+        pd.DataFrame(columns=columns).to_csv(output_path, index=False, encoding="utf-8-sig")
+    return row_count, latest_yielded_count
+
+
+def _control_summary(events: pd.DataFrame, distribution: pd.DataFrame, config: dict[str, object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    filled = events.loc[events["status"].eq("filled")]
+    portfolios = summarize_by_signal_date(filled)
+    for variant in config["variants"]:
+        for horizon in config["horizons"]:
+            observed_values = portfolios.loc[
+                (portfolios["variant"] == variant) & (portfolios["horizon"] == horizon),
+                "portfolio_net_return",
+            ]
+            control_values = distribution.loc[
+                (distribution["variant"] == variant) & (distribution["horizon"] == horizon),
+                "control_mean_return",
+            ].dropna()
+            observed_mean = float(observed_values.mean()) if not observed_values.empty else float("nan")
+            rows.append(
+                {
+                    "variant": str(variant),
+                    "horizon": int(horizon),
+                    "observed_mean": observed_mean,
+                    "control_mean": float(control_values.mean()) if not control_values.empty else float("nan"),
+                    "control_percentile": float((control_values <= observed_mean).mean()) if not control_values.empty and pd.notna(observed_mean) else float("nan"),
+                    "empirical_p_value": float((control_values >= observed_mean).mean()) if not control_values.empty and pd.notna(observed_mean) else float("nan"),
+                }
+            )
+    return rows
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run streaming TDX B1 event study.")
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--progress-interval-seconds", type=float, default=60.0)
+    args = parser.parse_args(argv)
+    config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+    validate_event_config(config)
+    validate_technical_only_config(config)
+    source = Path(args.source)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    total_files = count_tdx_mainboard_files(source)
+    progress_reporter = ProgressReporter(output / "progress.jsonl", total_files, float(args.progress_interval_seconds))
+    progress_reporter.update("signal_audit", force=True)
+    signal_audit_rows, signal_audit_code_windows = _write_signal_audit(source, config, output / "signal_audit.csv", progress_reporter)
+    progress_reporter.update("signal_audit", total_files, signal_audit_code_windows, force=True, done=True, event_count=signal_audit_rows)
+    progress_reporter.update("signal_events", force=True)
+    signal_progress = {"scanned": 0, "yielded": 0}
+    def signal_progress_callback(scanned_count: int, yielded_count: int) -> None:
+        signal_progress["scanned"] = scanned_count
+        signal_progress["yielded"] = yielded_count
+        progress_reporter.update("signal_events", scanned_count, yielded_count)
+
+    events, metadata = collect_signal_events(
+        source,
+        config,
+        progress_callback=signal_progress_callback,
+    )
+    progress_reporter.update("signal_events", total_files, signal_progress["yielded"], event_count=len(events), force=True, done=True)
+    signal_dates = {(variant, horizon): set(group["signal_date"]) for (variant, horizon), group in events.loc[events["status"].eq("filled")].groupby(["variant", "horizon"])}
+    progress_reporter.update("control_events", force=True)
+    control_progress = {"scanned": 0, "yielded": 0}
+    def control_progress_callback(scanned_count: int, yielded_count: int) -> None:
+        control_progress["scanned"] = scanned_count
+        control_progress["yielded"] = yielded_count
+        progress_reporter.update("control_events", scanned_count, yielded_count, event_count=len(events))
+
+    controls = collect_control_events(
+        source,
+        config,
+        signal_dates,
+        progress_callback=control_progress_callback,
+    )
+    progress_reporter.update("control_events", total_files, control_progress["yielded"], candidate_event_count=len(controls), force=True, done=True)
+    progress_reporter.update("sampling_and_writing", event_count=len(events), candidate_event_count=len(controls), force=True)
+    distribution = sample_control_distribution(events, controls, int(config["control_iterations"]), int(config["random_seed"]))
+    summaries = summarize_events(events)
+    _write_csv(events, output / "events.csv")
+    _write_csv(controls, output / "control_candidates.csv")
+    _write_csv(summaries, output / "summary.csv")
+    _write_csv(summarize_by_signal_date(events), output / "date_portfolios.csv")
+    _write_csv(distribution, output / "control_distribution.csv")
+    (output / "control_summary.json").write_text(json.dumps(_control_summary(events, distribution, config), ensure_ascii=False, indent=2), encoding="utf-8")
+    report = [
+        "# Streaming B1 Event Study",
+        "",
+        f"- Analysis window: {config['analysis_start']} to {config['analysis_end']}",
+        "- Scope: technical-only; historical market-cap and ST filters are not validated.",
+        f"- Processed code windows: {metadata['processed_code_count']}",
+        f"- Signal audit rows: {signal_audit_rows}",
+        f"- Candidate control events: {len(controls)}",
+        "",
+        "## Summary",
+        "",
+        _markdown_table(summaries),
+    ]
+    (output / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    progress_reporter.update("sampling_and_writing", event_count=len(events), candidate_event_count=len(controls), force=True, done=True)
+    metadata = {
+        **metadata,
+        **progress_reporter.metadata(),
+        "signal_audit_row_count": signal_audit_rows,
+        "signal_audit_code_window_count": signal_audit_code_windows,
+        "candidate_control_event_count": int(len(controls)),
+        "total_target_file_count": total_files,
+        "data_scope_label": config.get("data_scope_label", metadata.get("data_scope_label")),
+        "price_adjustment": config.get("price_adjustment", "unadjusted"),
+        "field_limitations": ["historical_market_cap_unavailable", "historical_st_status_unavailable"],
+    }
+    (output / "streaming_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

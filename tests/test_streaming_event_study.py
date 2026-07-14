@@ -1,11 +1,15 @@
 import struct
 import tempfile
 import unittest
+import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pandas as pd
 
 from a_share_backtesting.streaming_event_study import collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
+from a_share_backtesting.streaming_event_study_run import main as streaming_main
 
 
 class TestStreamingEventStudy(unittest.TestCase):
@@ -19,6 +23,11 @@ class TestStreamingEventStudy(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(struct.pack("<IIIIIfII", code_date, 1000, 1010, 990, 1005, 0.0, 1, 0))
 
+    def write_records(self, relative_path: str, records: list[tuple[int, int, int, int, int, float, int, int]]) -> None:
+        path = self.source / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"".join(struct.pack("<IIIIIfII", *record) for record in records))
+
     def test_iterator_yields_one_normalized_code_frame_at_a_time(self) -> None:
         self.write_day("sh/lday/sh600000.day", 20250102)
         self.write_day("sz/lday/sz000001.day", 20250102)
@@ -29,6 +38,14 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertEqual([frame["code"].iat[0] for frame in frames], ["600000", "000001"])
         self.assertTrue(all(frame["code"].nunique() == 1 for frame in frames))
         self.assertTrue(all(frame.loc[0, "market_cap"] == 0 for frame in frames))
+
+    def test_iterator_skips_code_frames_outside_warmup_window(self) -> None:
+        self.write_day("sh/lday/sh600000.day", 20200102)
+        self.write_day("sz/lday/sz000001.day", 20250102)
+
+        frames = list(iter_tdx_mainboard_bars(self.source, pd.Timestamp("2025-01-01"), pd.Timestamp("2026-01-31")))
+
+        self.assertEqual([frame["code"].iat[0] for frame in frames], ["000001"])
 
     def test_collects_events_without_returning_daily_bar_frames(self) -> None:
         records = []
@@ -80,6 +97,51 @@ class TestStreamingEventStudy(unittest.TestCase):
 
         self.assertEqual(first.to_dict("records"), second.to_dict("records"))
         self.assertEqual(len(first), 3)
+
+    def test_streaming_cli_writes_research_artifacts_and_metadata(self) -> None:
+        records = []
+        for index, date in enumerate(pd.bdate_range("2025-10-01", periods=45)):
+            price = 1000 + index * 10
+            records.append((int(date.strftime("%Y%m%d")), price, price + 20, price - 20, price + 10, 0.0, 10000 - index, 0))
+        self.write_records("sh/lday/sh600000.day", records)
+        self.write_day("sz/lday/sz000001.day", 20200102)
+        config = {"analysis_start": "2025-10-01", "analysis_end": "2025-12-31", "variants": ["legacy"], "horizons": [2], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "output"
+        config_path.write_text(json.dumps(config), encoding="utf-8-sig")
+
+        self.assertEqual(streaming_main(["--source", str(self.source), "--config", str(config_path), "--output", str(output_path)]), 0)
+
+        expected = {"signal_audit.csv", "events.csv", "date_portfolios.csv", "summary.csv", "control_distribution.csv", "control_summary.json", "report.md", "streaming_metadata.json"}
+        self.assertTrue(expected.issubset({path.name for path in output_path.iterdir()}))
+        metadata = json.loads((output_path / "streaming_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["processed_code_count"], 1)
+        self.assertIn("technical-only", (output_path / "report.md").read_text(encoding="utf-8"))
+
+    def test_streaming_cli_reports_progress_to_stdout_and_jsonl(self) -> None:
+        records = []
+        for index, date in enumerate(pd.bdate_range("2025-10-01", periods=45)):
+            price = 1000 + index * 10
+            records.append((int(date.strftime("%Y%m%d")), price, price + 20, price - 20, price + 10, 0.0, 10000 - index, 0))
+        self.write_records("sh/lday/sh600000.day", records)
+        self.write_day("sz/lday/sz000001.day", 20200102)
+        config = {"analysis_start": "2025-10-01", "analysis_end": "2025-12-31", "variants": ["legacy"], "horizons": [2], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "output"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            self.assertEqual(streaming_main(["--source", str(self.source), "--config", str(config_path), "--output", str(output_path), "--progress-interval-seconds", "0"]), 0)
+
+        self.assertIn("progress", stdout.getvalue())
+        progress_records = [json.loads(line) for line in (output_path / "progress.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue({"signal_audit", "signal_events", "control_events", "sampling_and_writing"}.issubset({record["stage"] for record in progress_records}))
+        self.assertEqual(progress_records[-1]["overall_percent"], 100.0)
+        self.assertIn("elapsed_seconds", progress_records[-1])
+        metadata = json.loads((output_path / "streaming_metadata.json").read_text(encoding="utf-8"))
+        self.assertIn("total_elapsed_seconds", metadata)
+        self.assertTrue({"signal_audit", "signal_events", "control_events", "sampling_and_writing"}.issubset(metadata["stage_durations_seconds"]))
 
 
 if __name__ == "__main__":

@@ -11,23 +11,28 @@
 - 流式任务1完成并推送：逐股读取、预热、信号和事件测量，不保留全市场日线：`2645b15`、`940ac13`。
 - 流式任务2核心完成并推送：第二遍逐股生成同日非信号候选事件、固定随机种子抽样：`32fb50e`。
 - 已验证：在提交 `32fb50e` 时，完整单元测试为 30/30 通过。
+- 本轮续作已补充测试：空窗口股票帧跳过、流式 CLI 产物写出、BOM JSON 配置读取、进度日志与阶段耗时元数据；完整单元测试为 33/33 通过。
+- 流式 CLI 初稿已补齐七类研究产物：`signal_audit.csv`、`events.csv`、`date_portfolios.csv`、`summary.csv`、`control_distribution.csv`、`control_summary.json`、`report.md`，并额外写出 `streaming_metadata.json` 和 `control_candidates.csv`。
+- 已用 6 个真实通达信 `.day` 样本文件试跑：原始 1000 次控制迭代配置 15.667 秒完成，输出 12 个 `variant + horizon` 组合各 1000 行控制分布；样本元数据为 3 个有效窗口代码、4,713 行信号审计、737 个候选对照事件。
+- 已诊断此前“长时间无输出”的主要可复现原因之一：随机对照抽样在迭代内反复筛选 DataFrame；现已改为预先按 `variant + horizon + signal_date` 建候选池索引。
+- 已新增流式 CLI 进度汇报：参数 `--progress-interval-seconds` 默认 60 秒，控制台输出 `progress {...}`，同时写入 `progress.jsonl`；`streaming_metadata.json` 记录 `total_elapsed_seconds` 与 `stage_durations_seconds`。
 
 ## 当前未提交状态与阻塞点
 
-- 工作区有未提交改动：`src/a_share_backtesting/streaming_event_study.py`（跳过研究窗口为空的股票帧）和 `src/a_share_backtesting/streaming_event_study_run.py`（流式 CLI 初稿）。两者尚未经过完整测试，不能提交或作为完成结论。
-- `data/daily_bars_technical.metadata.json` 是未跟踪的本地研究数据；保持忽略，不提交。
-- 流式 CLI 已两次尝试真实全量运行：第一次暴露空帧缺少 BBI 列，已在未提交改动中修复；第二次约 33 秒后无输出退出，且未生成 `outputs/event_study_technical_2026h1`。不能将真实回测视为已完成。
-- 下一步必须先为“空窗口股票被跳过”和流式 CLI 产物写失败测试，再运行全量测试；之后诊断第二次无输出退出的资源/进程原因，禁止直接把当前 CLI 提交。
+- 今日源码、测试与开发记录准备提交为一个进度提交；提交后本地不应保留未提交代码变更。
+- `data/daily_bars_technical.metadata.json` 是本地研究数据；保持忽略，不提交。
+- 本轮发现并停止了一个残留全量流式 CLI 进程和一个样本长跑进程；当前不应再依赖此前 `outputs/event_study_technical_2026h1` 的任何半成品。
+- 真实全量 3,439 个目标主板文件尚未重新跑完；不能将真实回测视为已完成，也不能提交或推送为最终结果。
 
 ## 下一步执行顺序
 
-1. 运行 `git status --short`，保留上述未提交文件，不覆盖任何改动。
-2. 测试先行补充空帧与流式 CLI 测试，运行完整测试套件。
-3. 用小型本地夹具验证 CLI 七类研究产物与流式元数据。
-4. 分阶段运行真实数据：先限制少量文件验证，再执行全量；记录退出码、产物存在性、事件数和内存/进程证据。
-5. 仅当真实产物完整且审计通过时，更新本文件、提交源码和文档、推送 `codex/b1-event-study`。
+1. 运行 `git status --short`，确认仅保留上述未提交源码、测试、文档和本地研究数据，不覆盖任何改动。
+2. 再次确认没有残留 `streaming_event_study_run` 进程。
+3. 运行全量真实数据 CLI：`--source C:\Users\playd\Desktop\A_Share_Backtesting\data\tdx_raw --config config\event_study_technical_only.json --output outputs\event_study_technical_2026h1 --progress-interval-seconds 60`。
+4. 记录退出码、耗时、产物存在性、事件数、12 个组合的控制分布行数、`streaming_metadata.json` 和进程/内存证据。
+5. 全量产物完整且审计通过后，再更新本文件、提交源码和文档、推送 `codex/b1-event-study`。
 
-最后更新：2026-07-13（Asia/Shanghai）
+最后更新：2026-07-14（Asia/Shanghai）
 
 ## 当前目标
 
