@@ -9,7 +9,7 @@
 ## 工作状态
 
 - 开发分支：`codex/b1-event-study`
-- 工作树：`C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study`
+- 当前工作树：随机器而变；以分支 `codex/b1-event-study` 和本文件的提交号为准。
 - 基线提交：`06c3899`（`chore: establish B1 event study baseline`）
 - 实施计划：[docs/superpowers/plans/2026-07-13-b1-event-study.md](docs/superpowers/plans/2026-07-13-b1-event-study.md)
 - 已完成：清理此前连续组合回测路径；保留指标、信号基础和最小测试。
@@ -18,7 +18,9 @@
 - 验证：`python -m unittest discover -s tests -v`，7 项通过。
 - 已完成：Task 2（`legacy`、`bbi`、`b1` 信号变体与首次触发标记），提交 `2f3332f`。
 - 验证：`python -m unittest discover -s tests -v`，10 项通过。
-- 下一任务：Task 3（事件入场、持有期、未成交状态、收益与回撤测量）。
+- 已完成：Task 3（事件入场、持有期、未成交状态、收益与回撤测量），提交 `ab3fcb3`。
+- 验证：`python -m unittest discover -s tests -v`，14 项通过。
+- 下一任务：Task 4（按信号日汇总与确定性随机对照组）。
 
 ## 已确定的研究口径
 
@@ -30,9 +32,9 @@
 
 ## 下一步
 
-1. 创建 `event_study.py`，将首次信号转换为不可重叠的持有期事件。
-2. 测试下一开盘入场、2/5/10/20 日退出、涨停未买、停牌/跌停未卖及最大不利波动。
-3. 通过全量测试后提交，并在本文件中写入提交号与 Task 4。
+1. 创建 `statistics.py`，按信号日等权汇总每个 `variant + horizon` 的事件收益。
+2. 使用固定随机种子从同日可选池抽样，生成可复现的随机对照分布。
+3. 通过全量测试后提交，并在本文件中写入提交号与 Task 5。
 
 ## 跨机器续作
 
