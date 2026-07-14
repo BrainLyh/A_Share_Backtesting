@@ -1,5 +1,7 @@
 import sys
 import unittest
+import json
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -7,6 +9,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from a_share_backtesting.event_study import measure_events
+from a_share_backtesting.event_study_run import main
 
 
 def event_config() -> dict[str, object]:
@@ -61,6 +64,21 @@ class TestEventStudy(unittest.TestCase):
         frame.loc[1, "low"] = 8.8
         event = measure_events(frame, "legacy", 2, event_config()).iloc[0]
         self.assertAlmostEqual(event["max_adverse_excursion"], -0.12)
+
+    def test_cli_writes_research_artifacts(self):
+        rows = []
+        for index, date in enumerate(pd.bdate_range("2025-10-01", periods=45)):
+            close = 10 + index * 0.1
+            rows.append({"date": date, "code": "600000", "name": "示例股票", "open": close - 0.05, "high": close + 0.2, "low": close - 0.2, "close": close, "volume": 10000 - index, "market_cap": 20000000000, "is_st": False, "is_suspended": False})
+        config = {"analysis_start": "2025-10-01", "analysis_end": "2025-12-31", "variants": ["legacy"], "horizons": [2], "require_core_pool": False, "min_market_cap": 10000000000, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, **event_config(), "control_iterations": 2, "random_seed": 1}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parents[1]) as directory:
+            bars_path = Path(directory) / "bars.csv"
+            config_path = Path(directory) / "config.json"
+            output_path = Path(directory) / "output"
+            pd.DataFrame(rows).to_csv(bars_path, index=False)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            self.assertEqual(main(["--data", str(bars_path), "--config", str(config_path), "--output", str(output_path)]), 0)
+            self.assertTrue({"signal_audit.csv", "events.csv", "date_portfolios.csv", "summary.csv", "control_distribution.csv", "control_summary.json", "report.md"}.issubset({path.name for path in output_path.iterdir()}))
 
 
 if __name__ == "__main__":
