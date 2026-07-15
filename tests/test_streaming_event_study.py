@@ -116,7 +116,10 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertTrue(expected.issubset({path.name for path in output_path.iterdir()}))
         metadata = json.loads((output_path / "streaming_metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["processed_code_count"], 1)
-        self.assertIn("technical-only", (output_path / "report.md").read_text(encoding="utf-8"))
+        self.assertIn("suspension_status_unavailable", metadata["field_limitations"])
+        report = (output_path / "report.md").read_text(encoding="utf-8")
+        self.assertIn("technical-only", report)
+        self.assertIn("suspension_status_unavailable", report)
 
     def test_streaming_cli_reports_progress_to_stdout_and_jsonl(self) -> None:
         records = []

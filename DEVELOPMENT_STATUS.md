@@ -1,5 +1,34 @@
 # 开发进度报告
 
+> 2026-07-15 全量运行审计（优先阅读本节）
+
+## 全量 CLI 结果
+
+- 全量流式 CLI 已在真实开发 worktree `C:\Users\playd\Desktop\A_Share_Backtesting\.worktrees\codex-b1-event-study` 跑完，输出目录为 `outputs/event_study_technical_2026h1`。
+- 产物齐全：`signal_audit.csv`、`events.csv`、`date_portfolios.csv`、`summary.csv`、`control_distribution.csv`、`control_summary.json`、`report.md`、`streaming_metadata.json`、`progress.jsonl`、`control_candidates.csv`。
+- `progress.jsonl` 最后一条为 `overall_percent=100.0`；`streaming_metadata.json` 记录总耗时 `6899.734` 秒（约 1 小时 55 分）。
+- 数据处理计数：目标文件 3,439 个，有效窗口代码 3,339 个，信号审计行 4,842,212，事件 730,844，已成交事件 728,754，候选对照事件 7,411,192。
+- `summary.csv` 有 12 行，覆盖 `legacy`、`bbi`、`b1` 与 2、5、10、20 日全部组合；`control_distribution.csv` 有 12,000 行，每个组合 1,000 次随机对照，且没有 NaN。
+- 事件状态审计正常：`insufficient_history` 与 `unfilled_entry` 的收益为空，未虚构收益。
+
+## 结果初读
+
+- 技术条件版结果显示：`b1` 四个持有期平均净收益均为负，且相对同日随机对照偏弱；当前不能把 B1 作为有效增强信号。
+- `bbi` 的 10、20 日平均净收益略正，但优势不稳定；`legacy` 的 20 日相对随机对照较强，值得后续按年份和市场阶段拆分复核。
+- 本轮结论仍限于“技术条件版”：未验证历史市值、ST 与真实停牌状态过滤，价格为未复权通达信日线。
+
+## 本轮代码/报告披露修正
+
+- 已补充流式 CLI 报告与 `streaming_metadata.json` 的字段限制披露：`historical_market_cap_unavailable`、`historical_st_status_unavailable`、`suspension_status_unavailable`。
+- 已补充回归测试，要求流式 CLI 的 metadata 和 report 同时披露 `suspension_status_unavailable`。
+- 已验证：`python -m unittest discover -s tests -v`，33/33 通过。
+
+## 下一步
+
+1. 提交并推送本轮披露修正与进度记录。
+2. 做正式结果解读文档，优先按年份、市场阶段、信号触发条件拆分解释 `legacy`、`bbi`、`b1` 的差异。
+3. 如需进一步提高结论可信度，补充可获取的逐日 ST、停牌、市值或历史指数成分数据后，再跑非技术条件版复核。
+
 > 2026-07-14 续开发记录（优先阅读本节）
 
 ## 今日完成
@@ -32,7 +61,7 @@
 4. 记录退出码、耗时、产物存在性、事件数、12 个组合的控制分布行数、`streaming_metadata.json` 和进程/内存证据。
 5. 全量产物完整且审计通过后，再更新本文件、提交源码和文档、推送 `codex/b1-event-study`。
 
-最后更新：2026-07-14（Asia/Shanghai）
+最后更新：2026-07-15（Asia/Shanghai）
 
 ## 当前目标
 

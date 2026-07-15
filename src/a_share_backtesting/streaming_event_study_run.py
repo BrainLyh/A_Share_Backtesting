@@ -22,6 +22,12 @@ STAGE_ORDER = {
     "sampling_and_writing": 3,
 }
 
+FIELD_LIMITATIONS = [
+    "historical_market_cap_unavailable",
+    "historical_st_status_unavailable",
+    "suspension_status_unavailable",
+]
+
 
 class ProgressReporter:
     def __init__(self, path: Path, total_files: int, interval_seconds: float, stream: object | None = None) -> None:
@@ -212,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         "# Streaming B1 Event Study",
         "",
         f"- Analysis window: {config['analysis_start']} to {config['analysis_end']}",
-        "- Scope: technical-only; historical market-cap and ST filters are not validated.",
+        "- Scope: technical-only; historical market-cap, ST and suspension filters are not validated.",
+        "- Field limitations: " + ", ".join(FIELD_LIMITATIONS),
         f"- Processed code windows: {metadata['processed_code_count']}",
         f"- Signal audit rows: {signal_audit_rows}",
         f"- Candidate control events: {len(controls)}",
@@ -232,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         "total_target_file_count": total_files,
         "data_scope_label": config.get("data_scope_label", metadata.get("data_scope_label")),
         "price_adjustment": config.get("price_adjustment", "unadjusted"),
-        "field_limitations": ["historical_market_cap_unavailable", "historical_st_status_unavailable"],
+        "field_limitations": FIELD_LIMITATIONS,
     }
     (output / "streaming_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0

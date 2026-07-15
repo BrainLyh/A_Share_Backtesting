@@ -40,9 +40,7 @@ def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     prior_close = data.groupby("code", sort=False)["close"].shift(1)
     prior_k = data.groupby("code", sort=False)["k"].shift(1)
     prior_d = data.groupby("code", sort=False)["d"].shift(1)
-    pit_seen = data.groupby("code", sort=False)["j"].transform(
-        lambda values: values.rolling(int(config["pit_lookback"]), min_periods=1).min()
-    ) < float(config["j_threshold"])
+    prior_j_below_threshold = prior_j < float(config["j_threshold"])
 
     data["legacy_pullback_signal"] = (
         eligibility
@@ -50,14 +48,14 @@ def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
         & (data["dif"] > 0)
         & (data["volume"] < prior_volume)
     )
-    trend = (data["close"] > data["bbi"]) & (data["bbi"] > prior_bbi)
-    j_turns_up = (data["j"] > prior_j) & pit_seen
+    above_bbi = data["close"] > data["bbi"]
+    j_turns_up = (data["j"] > prior_j) & prior_j_below_threshold
     right_side = (
         (data["close"] > data["open"])
         & (data["volume"] >= data["volume_ma"] * float(config["volume_multiplier"]))
         & ((prior_close <= prior_bbi) | (data["close"] > data["bbi"]))
     )
-    data["b1_entry_signal"] = eligibility & trend & j_turns_up & right_side & (data["dif"] > 0)
+    data["b1_entry_signal"] = eligibility & above_bbi & j_turns_up & right_side & (data["dif"] > 0)
     data["b1_exit_signal"] = (
         ((data["close"] < data["bbi"]) & (prior_close >= prior_bbi))
         | ((data["j"] >= 85) & (data["k"] < data["d"]) & (prior_k >= prior_d))
@@ -72,18 +70,17 @@ def build_signal_variants(frame: pd.DataFrame, config: dict[str, Any]) -> pd.Dat
     groups = data.groupby("code", sort=False)
     prior_bbi = groups["bbi"].shift(1)
     prior_j = groups["j"].shift(1)
-    prior_pit_seen = groups["j"].transform(
-        lambda values: values.shift(1).rolling(int(config["pit_lookback"]), min_periods=1).min()
-    ) < float(config["j_threshold"])
-    trend = (data["close"] > data["bbi"]) & (data["bbi"] > prior_bbi)
+    prior_j_below_threshold = prior_j < float(config["j_threshold"])
+    above_bbi = data["close"] > data["bbi"]
 
     data["legacy_signal"] = data["legacy_pullback_signal"]
+    trend = above_bbi & (data["bbi"] > prior_bbi)
     data["bbi_signal"] = data["legacy_signal"] & trend
     data["b1_signal"] = (
         data["eligible"]
-        & trend
+        & above_bbi
         & (data["dif"] > 0)
-        & prior_pit_seen
+        & prior_j_below_threshold
         & (data["j"] > prior_j)
         & (data["close"] > data["open"])
         & (data["volume"] >= data["volume_ma"] * float(config["volume_multiplier"]))
