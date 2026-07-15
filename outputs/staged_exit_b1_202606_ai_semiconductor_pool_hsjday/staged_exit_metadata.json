@@ -1,0 +1,40 @@
+{
+  "mode": "staged-exit-b1",
+  "analysis_start": "2026-06-01",
+  "analysis_end": "2026-06-30",
+  "horizons": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "processed_code_count": 171,
+  "event_count": 350,
+  "fill_count": 619,
+  "entry_price": "signal_day_close",
+  "take_profit_levels": [
+    {
+      "trigger_return": 0.05,
+      "sell_fraction": 0.3333333333333333
+    },
+    {
+      "trigger_return": 0.1,
+      "sell_fraction": 0.3333333333333333
+    },
+    {
+      "trigger_return": 0.15,
+      "sell_fraction": 1.0
+    }
+  ],
+  "stop_loss_return": -0.05,
+  "same_day_conflict_policy": "stop_loss_before_take_profit",
+  "expiry_exit_price": "horizon_day_close",
+  "field_limitations": [
+    "historical_market_cap_unavailable",
+    "historical_st_status_unavailable",
+    "suspension_status_unavailable"
+  ],
+  "stock_pool_path": "config\\ai_semiconductor_stock_pool_from_attachment_20260715.csv",
+  "stock_pool_count": 171
+}

@@ -1,0 +1,25 @@
+{
+  "mode": "close-entry-b1",
+  "analysis_start": "2026-06-01",
+  "analysis_end": "2026-07-15",
+  "horizons": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "processed_code_count": 171,
+  "event_count": 600,
+  "selected_signal_count": 120,
+  "entry_price": "signal_day_close",
+  "exit_price": "future_close",
+  "drawdown_price": "holding_period_intraday_low",
+  "field_limitations": [
+    "historical_market_cap_unavailable",
+    "historical_st_status_unavailable",
+    "suspension_status_unavailable"
+  ],
+  "stock_pool_path": "config\\ai_semiconductor_stock_pool_from_attachment_20260715.csv",
+  "stock_pool_count": 171
+}
