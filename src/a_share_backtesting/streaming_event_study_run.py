@@ -22,6 +22,21 @@ STAGE_ORDER = {
     "sampling_and_writing": 3,
 }
 
+
+CLOSE_ENTRY_COLUMNS = [
+    "event_id",
+    "code",
+    "name",
+    "horizon",
+    "signal_date",
+    "buy_close",
+    "exit_date",
+    "exit_close",
+    "net_return",
+    "max_intraday_drawdown",
+    "max_close_drawdown",
+    "status",
+]
 FIELD_LIMITATIONS = [
     "historical_market_cap_unavailable",
     "historical_st_status_unavailable",
@@ -131,6 +146,121 @@ def _write_signal_audit(source: Path, config: dict[str, object], output_path: Pa
     return row_count, latest_yielded_count
 
 
+
+def _measure_close_entry_returns(signals: pd.DataFrame, horizons: list[int], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    if signals.empty or "b1_first_trigger" not in signals.columns:
+        return pd.DataFrame(columns=CLOSE_ENTRY_COLUMNS)
+    rows: list[dict[str, object]] = []
+    data = signals.sort_values(["code", "date"]).copy()
+    data["date"] = pd.to_datetime(data["date"])
+    for code, bars in data.groupby("code", sort=False):
+        bars = bars.reset_index(drop=True)
+        trigger = bars["b1_first_trigger"].fillna(False).astype(bool) & bars["date"].between(start, end)
+        for signal_index in bars.index[trigger]:
+            signal = bars.loc[signal_index]
+            signal_date = pd.Timestamp(signal["date"])
+            buy_close = float(signal["close"])
+            for horizon in horizons:
+                horizon = int(horizon)
+                exit_index = int(signal_index) + horizon
+                base = {
+                    "event_id": f"{code}:b1_close:{horizon}:{signal_date:%Y%m%d}",
+                    "code": str(code),
+                    "name": signal.get("name", code),
+                    "horizon": horizon,
+                    "signal_date": signal_date,
+                    "buy_close": buy_close,
+                }
+                if exit_index >= len(bars):
+                    rows.append({**base, "exit_date": pd.NaT, "exit_close": float("nan"), "net_return": float("nan"), "max_intraday_drawdown": float("nan"), "max_close_drawdown": float("nan"), "status": "insufficient_history"})
+                    continue
+                exit_row = bars.loc[exit_index]
+                holding_window = bars.iloc[int(signal_index) + 1 : exit_index + 1]
+                exit_close = float(exit_row["close"])
+                min_low = float(holding_window["low"].min())
+                min_close = float(holding_window["close"].min())
+                rows.append(
+                    {
+                        **base,
+                        "exit_date": pd.Timestamp(exit_row["date"]),
+                        "exit_close": exit_close,
+                        "net_return": exit_close / buy_close - 1.0,
+                        "max_intraday_drawdown": min(min_low / buy_close - 1.0, 0.0),
+                        "max_close_drawdown": min(min_close / buy_close - 1.0, 0.0),
+                        "status": "filled",
+                    }
+                )
+    return pd.DataFrame(rows, columns=CLOSE_ENTRY_COLUMNS)
+
+
+def _summarize_close_entry_events(events: pd.DataFrame) -> pd.DataFrame:
+    columns = ["horizon", "event_count", "mean_net_return", "median_net_return", "win_rate", "mean_intraday_drawdown", "median_intraday_drawdown", "worst_intraday_drawdown", "mean_close_drawdown", "worst_close_drawdown"]
+    if events.empty:
+        return pd.DataFrame(columns=columns)
+    filled = events.loc[events["status"].eq("filled")]
+    if filled.empty:
+        return pd.DataFrame(columns=columns)
+    summary = filled.groupby("horizon", as_index=False).agg(
+        event_count=("event_id", "size"),
+        mean_net_return=("net_return", "mean"),
+        median_net_return=("net_return", "median"),
+        win_rate=("net_return", lambda values: float((values > 0).mean())),
+        mean_intraday_drawdown=("max_intraday_drawdown", "mean"),
+        median_intraday_drawdown=("max_intraday_drawdown", "median"),
+        worst_intraday_drawdown=("max_intraday_drawdown", "min"),
+        mean_close_drawdown=("max_close_drawdown", "mean"),
+        worst_close_drawdown=("max_close_drawdown", "min"),
+    )
+    return summary[columns]
+
+
+def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output: Path) -> int:
+    start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
+    horizons = [int(horizon) for horizon in config["horizons"]]
+    frames: list[pd.DataFrame] = []
+    processed_code_count = 0
+    for bars in iter_tdx_mainboard_bars(source, start, end):
+        processed_code_count += 1
+        signals = build_signal_variants(bars, config)
+        measured = _measure_close_entry_returns(signals, horizons, start, end)
+        if not measured.empty:
+            frames.append(measured)
+    events = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CLOSE_ENTRY_COLUMNS)
+    summary = _summarize_close_entry_events(events)
+    selected = events.loc[:, ["signal_date", "code", "name", "buy_close"]].drop_duplicates().sort_values(["signal_date", "code"]) if not events.empty else pd.DataFrame(columns=["signal_date", "code", "name", "buy_close"])
+    _write_csv(events, output / "close_entry_events.csv")
+    _write_csv(summary, output / "close_entry_summary.csv")
+    _write_csv(selected, output / "close_entry_selected_signals.csv")
+    metadata = {
+        "mode": "close-entry-b1",
+        "analysis_start": str(config["analysis_start"]),
+        "analysis_end": str(config["analysis_end"]),
+        "horizons": horizons,
+        "processed_code_count": processed_code_count,
+        "event_count": int(len(events)),
+        "selected_signal_count": int(len(selected)),
+        "entry_price": "signal_day_close",
+        "exit_price": "future_close",
+        "drawdown_price": "holding_period_intraday_low",
+        "field_limitations": FIELD_LIMITATIONS,
+    }
+    (output / "close_entry_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    report = [
+        "# Close-Entry B1 Backtest",
+        "",
+        f"- Analysis window: {config['analysis_start']} to {config['analysis_end']}",
+        "- Entry: signal-day close.",
+        "- Exit: future close by holding horizon.",
+        "- Drawdown: lowest intraday low during the holding window, capped at 0 when price never falls below entry.",
+        "- Scope: technical-only; historical market-cap, ST and suspension filters are not validated.",
+        "- Field limitations: " + ", ".join(FIELD_LIMITATIONS),
+        "",
+        "## Summary",
+        "",
+        _markdown_table(summary),
+    ]
+    (output / "close_entry_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    return 0
 def _control_summary(events: pd.DataFrame, distribution: pd.DataFrame, config: dict[str, object]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     filled = events.loc[events["status"].eq("filled")]
@@ -165,13 +295,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--progress-interval-seconds", type=float, default=60.0)
+    parser.add_argument("--mode", choices=["event-study", "close-entry-b1"], default="event-study")
+    parser.add_argument("--analysis-start")
+    parser.add_argument("--analysis-end")
+    parser.add_argument("--horizons", nargs="+", type=int)
     args = parser.parse_args(argv)
     config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+    if args.analysis_start is not None:
+        config["analysis_start"] = args.analysis_start
+    if args.analysis_end is not None:
+        config["analysis_end"] = args.analysis_end
+    if args.horizons is not None:
+        config["horizons"] = args.horizons
     validate_event_config(config)
     validate_technical_only_config(config)
     source = Path(args.source)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    if args.mode == "close-entry-b1":
+        return _run_close_entry_b1_backtest(source, config, output)
     total_files = count_tdx_mainboard_files(source)
     progress_reporter = ProgressReporter(output / "progress.jsonl", total_files, float(args.progress_interval_seconds))
     progress_reporter.update("signal_audit", force=True)

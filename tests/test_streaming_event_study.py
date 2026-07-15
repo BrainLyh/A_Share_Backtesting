@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from a_share_backtesting.streaming_event_study import collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
-from a_share_backtesting.streaming_event_study_run import main as streaming_main
+from a_share_backtesting.streaming_event_study_run import _measure_close_entry_returns, main as streaming_main
 
 
 class TestStreamingEventStudy(unittest.TestCase):
@@ -147,5 +147,60 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertTrue({"signal_audit", "signal_events", "control_events", "sampling_and_writing"}.issubset(metadata["stage_durations_seconds"]))
 
 
+    def test_close_entry_returns_use_signal_day_close_and_intraday_low_drawdown(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30", "2026-07-01"]),
+                "code": ["600000", "600000", "600000"],
+                "name": ["600000", "600000", "600000"],
+                "open": [9.8, 10.8, 8.8],
+                "high": [10.2, 11.2, 9.2],
+                "low": [9.7, 10.4, 8.0],
+                "close": [10.0, 11.0, 9.0],
+                "b1_first_trigger": [True, False, False],
+            }
+        )
+
+        result = _measure_close_entry_returns(signals, [1, 2], pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-30"))
+
+        self.assertEqual(result.loc[0, "buy_close"], 10.0)
+        self.assertEqual(result.loc[0, "exit_close"], 11.0)
+        self.assertAlmostEqual(result.loc[0, "net_return"], 0.1)
+        self.assertAlmostEqual(result.loc[1, "net_return"], -0.1)
+        self.assertAlmostEqual(result.loc[1, "max_intraday_drawdown"], -0.2)
+        self.assertAlmostEqual(result.loc[1, "max_close_drawdown"], -0.1)
+
+    def test_streaming_cli_writes_close_entry_backtest_outputs(self) -> None:
+        records = []
+        for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
+            price = 1000 + index * 10
+            records.append((int(date.strftime("%Y%m%d")), price, price + 20, price - 20, price + 10, 0.0, 10000 + index * 100, 0))
+        self.write_records("sh/lday/sh600000.day", records)
+        config = {"analysis_start": "2026-01-01", "analysis_end": "2026-12-31", "variants": ["legacy", "bbi", "b1"], "horizons": [1, 2], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "close_entry_output"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.assertEqual(
+            streaming_main(
+                [
+                    "--source", str(self.source),
+                    "--config", str(config_path),
+                    "--output", str(output_path),
+                    "--mode", "close-entry-b1",
+                    "--analysis-start", "2026-06-01",
+                    "--analysis-end", "2026-06-30",
+                    "--horizons", "1", "2",
+                ]
+            ),
+            0,
+        )
+
+        self.assertTrue((output_path / "close_entry_events.csv").exists())
+        self.assertTrue((output_path / "close_entry_summary.csv").exists())
+        metadata = json.loads((output_path / "close_entry_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["mode"], "close-entry-b1")
+        self.assertEqual(metadata["analysis_start"], "2026-06-01")
+        self.assertEqual(metadata["analysis_end"], "2026-06-30")
 if __name__ == "__main__":
     unittest.main()
