@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from a_share_backtesting.streaming_event_study import collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
-from a_share_backtesting.streaming_event_study_run import _measure_close_entry_returns, main as streaming_main
+from a_share_backtesting.streaming_event_study_run import _measure_close_entry_returns, _measure_staged_exit_returns, _summarize_staged_exit_events, main as streaming_main
 
 
 class TestStreamingEventStudy(unittest.TestCase):
@@ -189,6 +189,100 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertAlmostEqual(result.loc[1, "max_intraday_drawdown"], -0.2)
         self.assertAlmostEqual(result.loc[1, "max_close_drawdown"], -0.1)
 
+    def test_staged_exit_takes_first_profit_level_only(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30"]),
+                "code": ["600000", "600000"],
+                "name": ["600000", "600000"],
+                "open": [10.0, 10.0],
+                "high": [10.0, 10.6],
+                "low": [10.0, 10.1],
+                "close": [10.0, 10.2],
+                "b1_first_trigger": [True, False],
+            }
+        )
+
+        events, fills = _measure_staged_exit_returns(
+            signals, [1], pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-30")
+        )
+
+        self.assertAlmostEqual(events.loc[0, "net_return"], (1 / 3) * 0.05 + (2 / 3) * 0.02)
+        self.assertEqual(fills.loc[0, "fill_type"], "take_profit")
+        self.assertAlmostEqual(fills.loc[0, "sold_fraction"], 1 / 3)
+        self.assertAlmostEqual(fills.loc[0, "fill_price"], 10.5)
+
+    def test_staged_exit_same_day_stop_loss_precedes_take_profit(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30"]),
+                "code": ["600000", "600000"],
+                "name": ["600000", "600000"],
+                "open": [10.0, 10.0],
+                "high": [10.0, 10.8],
+                "low": [10.0, 9.4],
+                "close": [10.0, 10.2],
+                "b1_first_trigger": [True, False],
+            }
+        )
+
+        events, fills = _measure_staged_exit_returns(
+            signals, [1], pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-30")
+        )
+
+        self.assertAlmostEqual(events.loc[0, "net_return"], -0.05)
+        self.assertTrue(bool(events.loc[0, "stop_loss_triggered"]))
+        self.assertEqual(events.loc[0, "exit_reason"], "stop_loss")
+        self.assertEqual(fills.loc[0, "fill_type"], "stop_loss")
+        self.assertAlmostEqual(fills.loc[0, "fill_price"], 9.5)
+
+    def test_staged_exit_fills_multiple_profit_levels_then_expires_remainder(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30"]),
+                "code": ["600000", "600000"],
+                "name": ["600000", "600000"],
+                "open": [10.0, 10.0],
+                "high": [10.0, 11.2],
+                "low": [10.0, 10.4],
+                "close": [10.0, 10.3],
+                "b1_first_trigger": [True, False],
+            }
+        )
+
+        events, fills = _measure_staged_exit_returns(
+            signals, [1], pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-30")
+        )
+
+        self.assertAlmostEqual(events.loc[0, "net_return"], (1 / 3) * 0.05 + (1 / 3) * 0.10 + (1 / 3) * 0.03)
+        self.assertEqual(fills["fill_type"].tolist(), ["take_profit", "take_profit", "expiry"])
+        self.assertEqual(events.loc[0, "take_profit_fill_count"], 2)
+        self.assertAlmostEqual(events.loc[0, "remaining_fraction_at_expiry"], 1 / 3)
+
+    def test_staged_exit_summary_reports_rates_and_drawdowns(self) -> None:
+        events = pd.DataFrame(
+            {
+                "horizon": [1, 1, 1],
+                "event_id": ["a", "b", "c"],
+                "net_return": [0.05, -0.05, 0.01],
+                "win": [True, False, True],
+                "max_intraday_drawdown": [-0.01, -0.05, -0.02],
+                "position_weighted_drawdown": [-0.01, -0.05, -0.01],
+                "take_profit_fill_count": [1, 0, 0],
+                "stop_loss_triggered": [False, True, False],
+                "exit_reason": ["expiry", "stop_loss", "expiry"],
+                "status": ["filled", "filled", "filled"],
+            }
+        )
+
+        summary = _summarize_staged_exit_events(events)
+
+        self.assertEqual(summary.loc[0, "event_count"], 3)
+        self.assertAlmostEqual(summary.loc[0, "win_rate"], 2 / 3)
+        self.assertAlmostEqual(summary.loc[0, "stop_loss_rate"], 1 / 3)
+        self.assertAlmostEqual(summary.loc[0, "expiry_exit_rate"], 2 / 3)
+        self.assertAlmostEqual(summary.loc[0, "worst_intraday_drawdown"], -0.05)
+
     def test_streaming_cli_writes_close_entry_backtest_outputs(self) -> None:
         records = []
         for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
@@ -221,6 +315,40 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertEqual(metadata["mode"], "close-entry-b1")
         self.assertEqual(metadata["analysis_start"], "2026-06-01")
         self.assertEqual(metadata["analysis_end"], "2026-06-30")
+
+    def test_streaming_cli_writes_staged_exit_backtest_outputs(self) -> None:
+        records = []
+        for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
+            price = 1000 + index * 10
+            records.append((int(date.strftime("%Y%m%d")), price, price + 80, price - 20, price + 10, 0.0, 10000 + index * 100, 0))
+        self.write_records("sh/lday/sh600000.day", records)
+        config = {"analysis_start": "2026-01-01", "analysis_end": "2026-12-31", "variants": ["legacy", "bbi", "b1"], "horizons": [1, 2], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "staged_exit_output"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.assertEqual(
+            streaming_main(
+                [
+                    "--source", str(self.source),
+                    "--config", str(config_path),
+                    "--output", str(output_path),
+                    "--mode", "staged-exit-b1",
+                    "--analysis-start", "2026-06-01",
+                    "--analysis-end", "2026-06-30",
+                    "--horizons", "1", "2",
+                ]
+            ),
+            0,
+        )
+
+        expected = {"staged_exit_events.csv", "staged_exit_fills.csv", "staged_exit_summary.csv", "staged_exit_metadata.json", "staged_exit_report.md"}
+        self.assertTrue(expected.issubset({path.name for path in output_path.iterdir()}))
+        metadata = json.loads((output_path / "staged_exit_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["mode"], "staged-exit-b1")
+        self.assertEqual(metadata["analysis_start"], "2026-06-01")
+        self.assertEqual(metadata["analysis_end"], "2026-06-30")
+        self.assertIn("suspension_status_unavailable", metadata["field_limitations"])
 
     def test_close_entry_cli_uses_stock_pool(self) -> None:
         records = []

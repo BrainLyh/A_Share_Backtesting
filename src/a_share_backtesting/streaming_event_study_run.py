@@ -38,11 +38,44 @@ CLOSE_ENTRY_COLUMNS = [
     "max_close_drawdown",
     "status",
 ]
+STAGED_EXIT_EVENT_COLUMNS = [
+    "event_id",
+    "code",
+    "name",
+    "horizon",
+    "signal_date",
+    "entry_price",
+    "final_exit_date",
+    "status",
+    "exit_reason",
+    "net_return",
+    "win",
+    "max_intraday_drawdown",
+    "position_weighted_drawdown",
+    "take_profit_fill_count",
+    "stop_loss_triggered",
+    "remaining_fraction_at_expiry",
+]
+STAGED_EXIT_FILL_COLUMNS = [
+    "event_id",
+    "code",
+    "horizon",
+    "signal_date",
+    "fill_date",
+    "fill_type",
+    "trigger_return",
+    "fill_price",
+    "sold_fraction",
+    "remaining_fraction_after_fill",
+    "fill_return",
+]
 FIELD_LIMITATIONS = [
     "historical_market_cap_unavailable",
     "historical_st_status_unavailable",
     "suspension_status_unavailable",
 ]
+TAKE_PROFIT_LEVELS = [(0.05, 1.0 / 3.0), (0.10, 1.0 / 3.0), (0.15, 1.0)]
+STOP_LOSS_RETURN = -0.05
 
 
 class ProgressReporter:
@@ -208,6 +241,191 @@ def _measure_close_entry_returns(signals: pd.DataFrame, horizons: list[int], sta
     return pd.DataFrame(rows, columns=CLOSE_ENTRY_COLUMNS)
 
 
+def _fill_row(
+    event_id: str,
+    code: str,
+    horizon: int,
+    signal_date: pd.Timestamp,
+    fill_date: pd.Timestamp,
+    fill_type: str,
+    trigger_return: float,
+    fill_price: float,
+    sold_fraction: float,
+    remaining_fraction: float,
+    entry_price: float,
+) -> dict[str, object]:
+    return {
+        "event_id": event_id,
+        "code": str(code),
+        "horizon": int(horizon),
+        "signal_date": signal_date,
+        "fill_date": fill_date,
+        "fill_type": fill_type,
+        "trigger_return": float(trigger_return),
+        "fill_price": float(fill_price),
+        "sold_fraction": float(sold_fraction),
+        "remaining_fraction_after_fill": float(max(remaining_fraction, 0.0)),
+        "fill_return": float(fill_price / entry_price - 1.0),
+    }
+
+
+def _measure_staged_exit_returns(
+    signals: pd.DataFrame, horizons: list[int], start: pd.Timestamp, end: pd.Timestamp
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if signals.empty or "b1_first_trigger" not in signals.columns:
+        return pd.DataFrame(columns=STAGED_EXIT_EVENT_COLUMNS), pd.DataFrame(columns=STAGED_EXIT_FILL_COLUMNS)
+    event_rows: list[dict[str, object]] = []
+    fill_rows: list[dict[str, object]] = []
+    data = signals.sort_values(["code", "date"]).copy()
+    data["date"] = pd.to_datetime(data["date"])
+    for code, bars in data.groupby("code", sort=False):
+        bars = bars.reset_index(drop=True)
+        trigger = bars["b1_first_trigger"].fillna(False).astype(bool) & bars["date"].between(start, end)
+        for signal_index in bars.index[trigger]:
+            signal = bars.loc[signal_index]
+            signal_date = pd.Timestamp(signal["date"])
+            entry_price = float(signal["close"])
+            for horizon in horizons:
+                horizon = int(horizon)
+                event_id = f"{code}:b1_staged:{horizon}:{signal_date:%Y%m%d}"
+                exit_index = int(signal_index) + horizon
+                if exit_index >= len(bars):
+                    event_rows.append(
+                        {
+                            "event_id": event_id,
+                            "code": str(code),
+                            "name": signal.get("name", code),
+                            "horizon": horizon,
+                            "signal_date": signal_date,
+                            "entry_price": entry_price,
+                            "final_exit_date": pd.NaT,
+                            "status": "insufficient_history",
+                            "exit_reason": "insufficient_history",
+                            "net_return": float("nan"),
+                            "win": False,
+                            "max_intraday_drawdown": float("nan"),
+                            "position_weighted_drawdown": float("nan"),
+                            "take_profit_fill_count": 0,
+                            "stop_loss_triggered": False,
+                            "remaining_fraction_at_expiry": float("nan"),
+                        }
+                    )
+                    continue
+                remaining_fraction = 1.0
+                filled_levels: set[float] = set()
+                net_return = 0.0
+                exit_reason = "expiry"
+                final_exit_date = pd.Timestamp(bars.loc[exit_index, "date"])
+                max_intraday_drawdown = 0.0
+                position_weighted_drawdown = 0.0
+                stop_loss_triggered = False
+                expiry_remaining_fraction = 0.0
+                for row_index in range(int(signal_index) + 1, exit_index + 1):
+                    row = bars.loc[row_index]
+                    fill_date = pd.Timestamp(row["date"])
+                    low_return = float(row["low"]) / entry_price - 1.0
+                    max_intraday_drawdown = min(max_intraday_drawdown, low_return)
+                    position_weighted_drawdown = min(position_weighted_drawdown, low_return * remaining_fraction)
+                    if float(row["low"]) <= entry_price * (1.0 + STOP_LOSS_RETURN):
+                        sold_fraction = remaining_fraction
+                        remaining_fraction = 0.0
+                        fill_price = entry_price * (1.0 + STOP_LOSS_RETURN)
+                        net_return += sold_fraction * STOP_LOSS_RETURN
+                        fill_rows.append(
+                            _fill_row(
+                                event_id,
+                                str(code),
+                                horizon,
+                                signal_date,
+                                fill_date,
+                                "stop_loss",
+                                STOP_LOSS_RETURN,
+                                fill_price,
+                                sold_fraction,
+                                remaining_fraction,
+                                entry_price,
+                            )
+                        )
+                        stop_loss_triggered = True
+                        exit_reason = "stop_loss"
+                        final_exit_date = fill_date
+                        break
+                    for trigger_return, sell_fraction in TAKE_PROFIT_LEVELS:
+                        if trigger_return in filled_levels or remaining_fraction <= 0:
+                            continue
+                        if float(row["high"]) < entry_price * (1.0 + trigger_return):
+                            continue
+                        sold_fraction = min(sell_fraction, remaining_fraction)
+                        remaining_fraction -= sold_fraction
+                        fill_price = entry_price * (1.0 + trigger_return)
+                        net_return += sold_fraction * trigger_return
+                        filled_levels.add(trigger_return)
+                        fill_rows.append(
+                            _fill_row(
+                                event_id,
+                                str(code),
+                                horizon,
+                                signal_date,
+                                fill_date,
+                                "take_profit",
+                                trigger_return,
+                                fill_price,
+                                sold_fraction,
+                                remaining_fraction,
+                                entry_price,
+                            )
+                        )
+                        final_exit_date = fill_date
+                    if remaining_fraction <= 0:
+                        exit_reason = "take_profit"
+                        break
+                if remaining_fraction > 0:
+                    expiry = bars.loc[exit_index]
+                    expiry_return = float(expiry["close"]) / entry_price - 1.0
+                    expiry_remaining_fraction = remaining_fraction
+                    net_return += remaining_fraction * expiry_return
+                    remaining_after_expiry = 0.0
+                    fill_rows.append(
+                        _fill_row(
+                            event_id,
+                            str(code),
+                            horizon,
+                            signal_date,
+                            pd.Timestamp(expiry["date"]),
+                            "expiry",
+                            expiry_return,
+                            float(expiry["close"]),
+                            remaining_fraction,
+                            remaining_after_expiry,
+                            entry_price,
+                        )
+                    )
+                    remaining_fraction = 0.0
+                    final_exit_date = pd.Timestamp(expiry["date"])
+                    exit_reason = "expiry" if not stop_loss_triggered else exit_reason
+                event_rows.append(
+                    {
+                        "event_id": event_id,
+                        "code": str(code),
+                        "name": signal.get("name", code),
+                        "horizon": horizon,
+                        "signal_date": signal_date,
+                        "entry_price": entry_price,
+                        "final_exit_date": final_exit_date,
+                        "status": "filled",
+                        "exit_reason": exit_reason,
+                        "net_return": float(net_return),
+                        "win": bool(net_return > 0),
+                        "max_intraday_drawdown": float(max_intraday_drawdown),
+                        "position_weighted_drawdown": float(position_weighted_drawdown),
+                        "take_profit_fill_count": len(filled_levels),
+                        "stop_loss_triggered": stop_loss_triggered,
+                        "remaining_fraction_at_expiry": float(expiry_remaining_fraction),
+                    }
+                )
+    return pd.DataFrame(event_rows, columns=STAGED_EXIT_EVENT_COLUMNS), pd.DataFrame(fill_rows, columns=STAGED_EXIT_FILL_COLUMNS)
+
+
 def _summarize_close_entry_events(events: pd.DataFrame) -> pd.DataFrame:
     columns = ["horizon", "event_count", "mean_net_return", "median_net_return", "win_rate", "mean_intraday_drawdown", "median_intraday_drawdown", "worst_intraday_drawdown", "mean_close_drawdown", "worst_close_drawdown"]
     if events.empty:
@@ -225,6 +443,42 @@ def _summarize_close_entry_events(events: pd.DataFrame) -> pd.DataFrame:
         worst_intraday_drawdown=("max_intraday_drawdown", "min"),
         mean_close_drawdown=("max_close_drawdown", "mean"),
         worst_close_drawdown=("max_close_drawdown", "min"),
+    )
+    return summary[columns]
+
+
+def _summarize_staged_exit_events(events: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "horizon",
+        "event_count",
+        "mean_net_return",
+        "median_net_return",
+        "win_rate",
+        "mean_intraday_drawdown",
+        "worst_intraday_drawdown",
+        "mean_position_weighted_drawdown",
+        "worst_position_weighted_drawdown",
+        "mean_take_profit_fill_count",
+        "stop_loss_rate",
+        "expiry_exit_rate",
+    ]
+    if events.empty:
+        return pd.DataFrame(columns=columns)
+    filled = events.loc[events["status"].eq("filled")]
+    if filled.empty:
+        return pd.DataFrame(columns=columns)
+    summary = filled.groupby("horizon", as_index=False).agg(
+        event_count=("event_id", "size"),
+        mean_net_return=("net_return", "mean"),
+        median_net_return=("net_return", "median"),
+        win_rate=("win", lambda values: float(pd.Series(values).astype(bool).mean())),
+        mean_intraday_drawdown=("max_intraday_drawdown", "mean"),
+        worst_intraday_drawdown=("max_intraday_drawdown", "min"),
+        mean_position_weighted_drawdown=("position_weighted_drawdown", "mean"),
+        worst_position_weighted_drawdown=("position_weighted_drawdown", "min"),
+        mean_take_profit_fill_count=("take_profit_fill_count", "mean"),
+        stop_loss_rate=("stop_loss_triggered", lambda values: float(pd.Series(values).astype(bool).mean())),
+        expiry_exit_rate=("exit_reason", lambda values: float((pd.Series(values) == "expiry").mean())),
     )
     return summary[columns]
 
@@ -278,6 +532,67 @@ def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output
     ]
     (output / "close_entry_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     return 0
+
+
+def _run_staged_exit_b1_backtest(source: Path, config: dict[str, object], output: Path, code_filter: set[str] | None = None, stock_pool_path: Path | None = None) -> int:
+    start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
+    horizons = [int(horizon) for horizon in config["horizons"]]
+    event_frames: list[pd.DataFrame] = []
+    fill_frames: list[pd.DataFrame] = []
+    processed_code_count = 0
+    for bars in iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter):
+        processed_code_count += 1
+        signals = build_signal_variants(bars, config)
+        measured_events, measured_fills = _measure_staged_exit_returns(signals, horizons, start, end)
+        if not measured_events.empty:
+            event_frames.append(measured_events)
+        if not measured_fills.empty:
+            fill_frames.append(measured_fills)
+    events = pd.concat(event_frames, ignore_index=True) if event_frames else pd.DataFrame(columns=STAGED_EXIT_EVENT_COLUMNS)
+    fills = pd.concat(fill_frames, ignore_index=True) if fill_frames else pd.DataFrame(columns=STAGED_EXIT_FILL_COLUMNS)
+    summary = _summarize_staged_exit_events(events)
+    _write_csv(events, output / "staged_exit_events.csv")
+    _write_csv(fills, output / "staged_exit_fills.csv")
+    _write_csv(summary, output / "staged_exit_summary.csv")
+    metadata = {
+        "mode": "staged-exit-b1",
+        "analysis_start": str(config["analysis_start"]),
+        "analysis_end": str(config["analysis_end"]),
+        "horizons": horizons,
+        "processed_code_count": processed_code_count,
+        "event_count": int(len(events)),
+        "fill_count": int(len(fills)),
+        "entry_price": "signal_day_close",
+        "take_profit_levels": [
+            {"trigger_return": trigger_return, "sell_fraction": sell_fraction}
+            for trigger_return, sell_fraction in TAKE_PROFIT_LEVELS
+        ],
+        "stop_loss_return": STOP_LOSS_RETURN,
+        "same_day_conflict_policy": "stop_loss_before_take_profit",
+        "expiry_exit_price": "horizon_day_close",
+        "field_limitations": FIELD_LIMITATIONS,
+        "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
+        "stock_pool_count": len(code_filter) if code_filter is not None else None,
+    }
+    (output / "staged_exit_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    report = [
+        "# Staged-Exit B1 Backtest",
+        "",
+        f"- Analysis window: {config['analysis_start']} to {config['analysis_end']}",
+        "- Entry: signal-day close.",
+        "- Take profit: +5% sells one third, +10% sells one third, +15% sells all remaining.",
+        "- Stop loss: -5% sells all remaining.",
+        "- Same-day conflict policy: stop-loss before take-profit.",
+        "- Expiry: remaining position exits at the horizon-day close.",
+        "- Scope: technical-only; historical market-cap, ST and suspension filters are not validated.",
+        "- Field limitations: " + ", ".join(FIELD_LIMITATIONS),
+        "",
+        "## Summary",
+        "",
+        _markdown_table(summary),
+    ]
+    (output / "staged_exit_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    return 0
 def _control_summary(events: pd.DataFrame, distribution: pd.DataFrame, config: dict[str, object]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     filled = events.loc[events["status"].eq("filled")]
@@ -312,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--progress-interval-seconds", type=float, default=60.0)
-    parser.add_argument("--mode", choices=["event-study", "close-entry-b1"], default="event-study")
+    parser.add_argument("--mode", choices=["event-study", "close-entry-b1", "staged-exit-b1"], default="event-study")
     parser.add_argument("--analysis-start")
     parser.add_argument("--analysis-end")
     parser.add_argument("--horizons", nargs="+", type=int)
@@ -336,6 +651,8 @@ def main(argv: list[str] | None = None) -> int:
     output.mkdir(parents=True, exist_ok=True)
     if args.mode == "close-entry-b1":
         return _run_close_entry_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
+    if args.mode == "staged-exit-b1":
+        return _run_staged_exit_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
     total_files = count_tdx_mainboard_files(source, code_filter=code_filter)
     progress_reporter = ProgressReporter(output / "progress.jsonl", total_files, float(args.progress_interval_seconds))
     progress_reporter.update("signal_audit", force=True)
