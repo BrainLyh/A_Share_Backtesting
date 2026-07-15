@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from .data_contract import normalize_daily_bars
 from .event_study import EVENT_COLUMNS, measure_events
@@ -15,9 +15,47 @@ from .tdx_day import is_target_mainboard_path, read_tdx_day_file
 ProgressCallback = Callable[[int, int], None]
 
 
-def count_tdx_mainboard_files(source_root: Path) -> int:
+def _normalize_code_filter(code_filter: Collection[str] | None) -> set[str] | None:
+    if code_filter is None:
+        return None
+    return {str(code).strip().zfill(6) for code in code_filter if str(code).strip()}
+
+
+def _path_code(path: Path) -> str | None:
+    stem = path.stem.lower()
+    if len(stem) != 8 or stem[:2] not in {"sh", "sz", "bj"}:
+        return None
+    code = stem[2:]
+    return code if len(code) == 6 and code.isdigit() else None
+
+
+def _expected_market_prefix(code: str) -> str | None:
+    if code.startswith(("600", "601", "603", "605", "688")):
+        return "sh"
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return "sz"
+    if code.startswith(("4", "8", "9")):
+        return "bj"
+    return None
+
+
+def _is_selected_tdx_path(path: Path, code_filter: set[str] | None) -> bool:
+    if code_filter is None:
+        return is_target_mainboard_path(path)
+    if path.suffix.lower() != ".day":
+        return False
+    code = _path_code(path)
+    if code is None or code not in code_filter:
+        return False
+    expected_prefix = _expected_market_prefix(code)
+    return expected_prefix is None or path.stem[:2].lower() == expected_prefix
+
+
+
+def count_tdx_mainboard_files(source_root: Path, code_filter: Collection[str] | None = None) -> int:
     """Count target mainboard TDX files for progress reporting."""
-    return sum(1 for path in source_root.rglob("*.day") if is_target_mainboard_path(path))
+    normalized_filter = _normalize_code_filter(code_filter)
+    return sum(1 for path in source_root.rglob("*.day") if _is_selected_tdx_path(path, normalized_filter))
 
 
 def iter_tdx_mainboard_bars(
@@ -25,13 +63,15 @@ def iter_tdx_mainboard_bars(
     start: pd.Timestamp,
     end: pd.Timestamp,
     progress_callback: ProgressCallback | None = None,
+    code_filter: Collection[str] | None = None,
 ) -> Iterator[pd.DataFrame]:
-    """Yield one normalized technical-only mainboard frame per local TDX file."""
+    """Yield one normalized technical-only frame per selected local TDX file."""
     warmup_start = start - pd.offsets.BDay(180)
+    normalized_filter = _normalize_code_filter(code_filter)
     scanned_count = 0
     yielded_count = 0
     for path in sorted(source_root.rglob("*.day")):
-        if not is_target_mainboard_path(path):
+        if not _is_selected_tdx_path(path, normalized_filter):
             continue
         scanned_count += 1
         bars = read_tdx_day_file(path).assign(
@@ -55,12 +95,13 @@ def collect_signal_events(
     source_root: Path,
     config: dict[str, object],
     progress_callback: ProgressCallback | None = None,
+    code_filter: Collection[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Measure frozen signal events one code at a time and retain no daily-bar universe."""
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     event_frames: list[pd.DataFrame] = []
     processed_code_count = 0
-    for bars in iter_tdx_mainboard_bars(source_root, start, end, progress_callback=progress_callback):
+    for bars in iter_tdx_mainboard_bars(source_root, start, end, progress_callback=progress_callback, code_filter=code_filter):
         processed_code_count += 1
         signals = build_signal_variants(bars, config)
         for variant in config["variants"]:
@@ -77,13 +118,14 @@ def collect_control_events(
     config: dict[str, object],
     signal_dates: dict[tuple[str, int], set[pd.Timestamp]],
     progress_callback: ProgressCallback | None = None,
+    code_filter: Collection[str] | None = None,
 ) -> pd.DataFrame:
     """Collect same-date non-signal candidates in a second, per-code pass."""
     if not signal_dates:
         return pd.DataFrame(columns=EVENT_COLUMNS)
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     candidates: list[pd.DataFrame] = []
-    for bars in iter_tdx_mainboard_bars(source_root, start, end, progress_callback=progress_callback):
+    for bars in iter_tdx_mainboard_bars(source_root, start, end, progress_callback=progress_callback, code_filter=code_filter):
         signals = build_signal_variants(bars, config)
         for (variant, horizon), dates in signal_dates.items():
             trigger = f"{variant}_first_trigger"

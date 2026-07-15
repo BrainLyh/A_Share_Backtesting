@@ -1,4 +1,33 @@
 # 开发进度报告
+> 2026-07-15 AI/半导体股票池回测（优先阅读本节）
+
+## 本次完成
+
+- 已解析用户整理的股票池文件 `C:\Users\playd\Desktop\AI-Semiconductor-Stock-Universe-20260715.md`，提取并去重得到 171 个 6 位 A 股代码，保存为 `config/ai_semiconductor_stock_pool_20260715.csv`。
+- 流式 CLI 新增 `--stock-pool` 参数；传入股票池后，TDX 文件遍历按股票池代码精确过滤，不再只限原先沪深主板前缀。
+- 信号层新增股票池 universe：默认仍按原主板范围过滤；传入 `stock_pool_codes` 时，`688/300/301/835438` 等非主板代码可作为候选参与 B1 计算。
+- 修复通达信目录中同一 6 位代码可能同时存在 `sh/lday` 与 `sz/lday` 的错前缀重复文件问题；股票池模式现在按代码段校验交易所前缀，避免双计数。
+- 已补充回归测试：股票池包含非主板代码、股票池 CLI 输出、股票池 universe eligibility、错市场前缀重复路径过滤。
+
+## 2026 年 6 月股票池 close-entry B1 回测
+
+- 命令模式：`--mode close-entry-b1 --analysis-start 2026-06-01 --analysis-end 2026-06-30 --horizons 1 2 3 4 5 --stock-pool config/ai_semiconductor_stock_pool_20260715.csv`。
+- 输出目录：`outputs/b1_close_entry_202606_ai_semiconductor_pool`。
+- 元数据：`stock_pool_count=171`，`processed_code_count=171`，`selected_signal_count=70`，`event_count=350`；买入价仍为 B1 当日收盘价，退出价为未来第 N 个交易日收盘价，回撤使用持仓期盘中最低价。
+- 汇总结果：持仓 1/2/3/4/5 日平均收益分别为 1.1321%、1.4203%、2.8320%、4.5795%、4.4233%；胜率分别为 61.43%、52.86%、57.97%、54.41%、64.18%。
+- 平均盘中最大回撤：持仓 1/2/3/4/5 日分别为 -3.1665%、-4.6136%、-5.8692%、-6.2379%、-6.9011%；最差盘中最大回撤分别为 -9.3778%、-15.7412%、-15.7412%、-17.6794%、-30.9002%。
+
+## 验证
+
+- 已运行完整单元测试：`python -m unittest discover -s tests -v`，42/42 通过。
+- 已重新运行股票池回测并确认 `processed_code_count` 与 `stock_pool_count` 均为 171，未再出现重复市场前缀导致的额外处理代码窗口。
+
+## 下一步
+
+1. 人工抽查 `outputs/b1_close_entry_202606_ai_semiconductor_pool/close_entry_selected_signals.csv` 中的 70 个 B1 信号，优先检查 6 月 3 日、6 月 4 日、6 月 15 日信号密集日期。
+2. 基于股票池结果新增行业/主题池对比：AI 半导体池 vs 全市场 6 月结果，确认收益改善来自行业趋势过滤，而不是样本期偶然。
+3. 下一轮策略改进建议增加“行业/主题池参数”作为显式输入，而不是把行业判断混入 KDJ/BBI 技术信号本身。
+
 
 > 2026-07-15 B1 规则与收盘买入回测（优先阅读本节）
 

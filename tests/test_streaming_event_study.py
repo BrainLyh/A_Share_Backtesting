@@ -39,6 +39,25 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertTrue(all(frame["code"].nunique() == 1 for frame in frames))
         self.assertTrue(all(frame.loc[0, "market_cap"] == 0 for frame in frames))
 
+
+    def test_iterator_stock_pool_includes_non_mainboard_codes(self) -> None:
+        self.write_day("sh/lday/sh688001.day", 20250102)
+        self.write_day("sz/lday/sz300001.day", 20250102)
+        self.write_day("sh/lday/sh600000.day", 20250102)
+
+        frames = list(iter_tdx_mainboard_bars(self.source, pd.Timestamp("2025-01-01"), pd.Timestamp("2026-01-31"), code_filter={"688001", "300001"}))
+
+        self.assertEqual([frame["code"].iat[0] for frame in frames], ["688001", "300001"])
+
+    def test_iterator_stock_pool_rejects_wrong_market_duplicate_paths(self) -> None:
+        self.write_day("sh/lday/sh000021.day", 20250102)
+        self.write_day("sz/lday/sz000021.day", 20250102)
+
+        frames = list(iter_tdx_mainboard_bars(self.source, pd.Timestamp("2025-01-01"), pd.Timestamp("2026-01-31"), code_filter={"000021"}))
+
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["code"].iat[0], "000021")
+
     def test_iterator_skips_code_frames_outside_warmup_window(self) -> None:
         self.write_day("sh/lday/sh600000.day", 20200102)
         self.write_day("sz/lday/sz000001.day", 20250102)
@@ -202,5 +221,26 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertEqual(metadata["mode"], "close-entry-b1")
         self.assertEqual(metadata["analysis_start"], "2026-06-01")
         self.assertEqual(metadata["analysis_end"], "2026-06-30")
+
+    def test_close_entry_cli_uses_stock_pool(self) -> None:
+        records = []
+        for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
+            price = 1000 + index * 10
+            records.append((int(date.strftime("%Y%m%d")), price, price + 20, price - 20, price + 10, 0.0, 10000 + index * 100, 0))
+        self.write_records("sh/lday/sh688001.day", records)
+        self.write_records("sh/lday/sh600000.day", records)
+        pool_path = Path(self.temp_dir.name) / "pool.csv"
+        pool_path.write_text("code\n688001\n", encoding="utf-8")
+        config = {"analysis_start": "2026-01-01", "analysis_end": "2026-12-31", "variants": ["legacy", "bbi", "b1"], "horizons": [1], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "pooled_output"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.assertEqual(streaming_main(["--source", str(self.source), "--config", str(config_path), "--output", str(output_path), "--mode", "close-entry-b1", "--analysis-start", "2026-06-01", "--analysis-end", "2026-06-30", "--horizons", "1", "--stock-pool", str(pool_path)]), 0)
+
+        metadata = json.loads((output_path / "close_entry_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["stock_pool_count"], 1)
+        events = pd.read_csv(output_path / "close_entry_events.csv", dtype={"code": str})
+        self.assertEqual(set(events["code"]), {"688001"})
 if __name__ == "__main__":
     unittest.main()

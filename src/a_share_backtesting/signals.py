@@ -19,6 +19,14 @@ def _main_board(code: pd.Series) -> pd.Series:
     return code.astype(str).str.zfill(6).str.startswith(MAIN_BOARD_PREFIXES)
 
 
+def _configured_universe(code: pd.Series, config: dict[str, Any]) -> pd.Series:
+    stock_pool_codes = config.get("stock_pool_codes")
+    if stock_pool_codes:
+        normalized_codes = {str(pool_code).strip().zfill(6) for pool_code in stock_pool_codes if str(pool_code).strip()}
+        return code.astype(str).str.zfill(6).isin(normalized_codes)
+    return _main_board(code)
+
+
 def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     data = add_grouped_indicators(frame)
     data["code"] = data["code"].astype(str).str.zfill(6)
@@ -26,7 +34,7 @@ def build_signals(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     data["is_suspended"] = _as_bool(data["is_suspended"])
     data["in_core_pool"] = _as_bool(data["in_core_pool"])
     name_is_st = data["name"].fillna("").astype(str).str.contains(r"\*?ST", flags=re.IGNORECASE, regex=True)
-    eligibility = _main_board(data["code"]) & ~data["is_st"] & ~name_is_st
+    eligibility = _configured_universe(data["code"], config) & ~data["is_st"] & ~name_is_st
     min_market_cap = float(config["min_market_cap"])
     if min_market_cap > 0:
         eligibility &= data["market_cap"] > min_market_cap

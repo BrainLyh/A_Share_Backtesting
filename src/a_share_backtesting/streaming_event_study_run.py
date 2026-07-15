@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -107,6 +108,20 @@ class ProgressReporter:
         }
 
 
+
+def _load_stock_pool(path: Path) -> set[str]:
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    if path.suffix.lower() == ".csv":
+        frame = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+        if "code" in frame.columns:
+            codes = frame["code"].dropna().astype(str).tolist()
+        else:
+            codes = re.findall(r"(?<!\d)\d{6}(?!\d)", text)
+    else:
+        codes = re.findall(r"(?<!\d)\d{6}(?!\d)", text)
+    return {str(code).strip().zfill(6) for code in codes if str(code).strip()}
+
+
 def _write_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False, encoding="utf-8-sig")
 
@@ -121,7 +136,7 @@ def _markdown_table(frame: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def _write_signal_audit(source: Path, config: dict[str, object], output_path: Path, progress_reporter: ProgressReporter | None = None) -> tuple[int, int]:
+def _write_signal_audit(source: Path, config: dict[str, object], output_path: Path, progress_reporter: ProgressReporter | None = None, code_filter: set[str] | None = None) -> tuple[int, int]:
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     columns = ["date", "code", "name", "eligible"] + [f"{variant}_first_trigger" for variant in config["variants"]]
     wrote_header = False
@@ -133,7 +148,7 @@ def _write_signal_audit(source: Path, config: dict[str, object], output_path: Pa
         if progress_reporter is not None:
             progress_reporter.update("signal_audit", scanned_count, yielded_count, event_count=row_count)
 
-    for bars in iter_tdx_mainboard_bars(source, start, end, progress_callback=progress_callback):
+    for bars in iter_tdx_mainboard_bars(source, start, end, progress_callback=progress_callback, code_filter=code_filter):
         signals = build_signal_variants(bars, config)
         audit = signals.loc[signals["date"].between(start, end), [column for column in columns if column in signals.columns]].copy()
         if audit.empty:
@@ -214,12 +229,12 @@ def _summarize_close_entry_events(events: pd.DataFrame) -> pd.DataFrame:
     return summary[columns]
 
 
-def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output: Path) -> int:
+def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output: Path, code_filter: set[str] | None = None, stock_pool_path: Path | None = None) -> int:
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     horizons = [int(horizon) for horizon in config["horizons"]]
     frames: list[pd.DataFrame] = []
     processed_code_count = 0
-    for bars in iter_tdx_mainboard_bars(source, start, end):
+    for bars in iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter):
         processed_code_count += 1
         signals = build_signal_variants(bars, config)
         measured = _measure_close_entry_returns(signals, horizons, start, end)
@@ -243,6 +258,8 @@ def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output
         "exit_price": "future_close",
         "drawdown_price": "holding_period_intraday_low",
         "field_limitations": FIELD_LIMITATIONS,
+        "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
+        "stock_pool_count": len(code_filter) if code_filter is not None else None,
     }
     (output / "close_entry_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     report = [
@@ -299,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--analysis-start")
     parser.add_argument("--analysis-end")
     parser.add_argument("--horizons", nargs="+", type=int)
+    parser.add_argument("--stock-pool")
     args = parser.parse_args(argv)
     config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
     if args.analysis_start is not None:
@@ -309,15 +327,19 @@ def main(argv: list[str] | None = None) -> int:
         config["horizons"] = args.horizons
     validate_event_config(config)
     validate_technical_only_config(config)
+    stock_pool_path = Path(args.stock_pool) if args.stock_pool is not None else None
+    code_filter = _load_stock_pool(stock_pool_path) if stock_pool_path is not None else None
+    if code_filter is not None:
+        config["stock_pool_codes"] = sorted(code_filter)
     source = Path(args.source)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if args.mode == "close-entry-b1":
-        return _run_close_entry_b1_backtest(source, config, output)
-    total_files = count_tdx_mainboard_files(source)
+        return _run_close_entry_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
+    total_files = count_tdx_mainboard_files(source, code_filter=code_filter)
     progress_reporter = ProgressReporter(output / "progress.jsonl", total_files, float(args.progress_interval_seconds))
     progress_reporter.update("signal_audit", force=True)
-    signal_audit_rows, signal_audit_code_windows = _write_signal_audit(source, config, output / "signal_audit.csv", progress_reporter)
+    signal_audit_rows, signal_audit_code_windows = _write_signal_audit(source, config, output / "signal_audit.csv", progress_reporter, code_filter=code_filter)
     progress_reporter.update("signal_audit", total_files, signal_audit_code_windows, force=True, done=True, event_count=signal_audit_rows)
     progress_reporter.update("signal_events", force=True)
     signal_progress = {"scanned": 0, "yielded": 0}
@@ -330,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         source,
         config,
         progress_callback=signal_progress_callback,
+        code_filter=code_filter,
     )
     progress_reporter.update("signal_events", total_files, signal_progress["yielded"], event_count=len(events), force=True, done=True)
     signal_dates = {(variant, horizon): set(group["signal_date"]) for (variant, horizon), group in events.loc[events["status"].eq("filled")].groupby(["variant", "horizon"])}
@@ -345,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         config,
         signal_dates,
         progress_callback=control_progress_callback,
+        code_filter=code_filter,
     )
     progress_reporter.update("control_events", total_files, control_progress["yielded"], candidate_event_count=len(controls), force=True, done=True)
     progress_reporter.update("sampling_and_writing", event_count=len(events), candidate_event_count=len(controls), force=True)
@@ -382,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
         "data_scope_label": config.get("data_scope_label", metadata.get("data_scope_label")),
         "price_adjustment": config.get("price_adjustment", "unadjusted"),
         "field_limitations": FIELD_LIMITATIONS,
+        "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
+        "stock_pool_count": len(code_filter) if code_filter is not None else None,
     }
     (output / "streaming_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0

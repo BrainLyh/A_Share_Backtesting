@@ -120,6 +120,19 @@ class TestSignalVariants(unittest.TestCase):
 
         self.assertTrue(result["eligible"].any())
 
+    def test_stock_pool_codes_define_eligible_universe(self):
+        bars = prepared_indicator_bars([50.0, 10.0, 20.0])
+        bars["code"] = "688001"
+
+        with patch("a_share_backtesting.signals.add_grouped_indicators", return_value=bars.copy()):
+            result = build_signal_variants(
+                bars,
+                baseline_config() | {"j_threshold": 15.0, "min_market_cap": 0, "stock_pool_codes": ["688001"]},
+            )
+
+        self.assertTrue(result["eligible"].all())
+        self.assertTrue(bool(result.loc[2, "b1_signal"]))
+
 
 if __name__ == "__main__":
     unittest.main()
