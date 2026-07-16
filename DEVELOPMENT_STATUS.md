@@ -37,6 +37,14 @@
 - 使用 rustdx 仓库示例 `assets/gbbq` 跑 688200 时，2026-06-11 仍未被识别为除权日：`preclose` 等于上一日原始 close，前复权结果仍等于未复权结果。因此 688200 尚未被修正，原因是缺少最新 gbbq/复权因子，不是 rustdx 命令链路不可用。
 - 结论：下一轮必须先补齐真实最新 gbbq 或其他可靠前复权因子，再重跑 688200、688766、688037 等异常跳变样本；在此之前，不建议继续根据未复权数据优化 ATR 止损阈值。
 
+## 开源工具借鉴记录
+
+- `zjp-CN/rustdx`（https://github.com/zjp-CN/rustdx）：当前优先级最高。可读取 TDX `.day`，并在提供 `gbbq` 时输出 `preclose/factor`，适合作为本项目 qfq 数据层的第一候选。短期任务是补齐真实最新 gbbq 后验证 688200；中期任务是把 rustdx 输出接入 `price_adjustment=qfq`。
+- `1nchaos/adata`（https://github.com/1nchaos/adata）：适合作为备用数据源和数据审计源。可用于补充股票列表、名称、行业/概念、行情交叉校验，尤其用于核对 TDX 未复权跳变和 qfq 结果是否合理；暂不建议直接替换本地 TDX 主数据源。
+- `shy3130/tickflow-stock-panel`（https://github.com/shy3130/tickflow-stock-panel）：最值得借鉴回测工程架构。重点参考其 enriched 特征表、策略文件结构、组合回测、T+1/手续费/滑点/持仓约束、流式进度和复盘面板思路。后续本项目可从事件回测升级为“每日 14:30 选股 + 组合持仓 + 资金曲线”的组合回测。
+- `khscience/OSkhQuant`（https://github.com/khscience/OSkhQuant）：更偏桌面 GUI、MiniQMT/xtquant、策略执行和实盘框架。短期不迁移其 GUI 架构，但可借鉴交易明细、风险指标、持仓限制、止损模块和 MyTT/通达信指标兼容思路。
+- 当前借鉴顺序：先用 rustdx/qfq 修正数据口径；再用 tickflow 的 enriched 表与策略配置方式重构回测输入；再用 adata 做交叉校验与行业/概念补充；最后视实盘或 GUI 需求参考 OSkhQuant。
+
 ## 验证
 
 - 已运行全量单元测试：`PYTHONPATH=src python -m unittest discover -s tests -v`，52/52 通过。
