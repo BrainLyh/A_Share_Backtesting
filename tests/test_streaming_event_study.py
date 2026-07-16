@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from a_share_backtesting.streaming_event_study import collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
+from a_share_backtesting.streaming_event_study import collect_control_events, collect_signal_events, iter_qfq_csv_bars, iter_tdx_mainboard_bars, sample_control_distribution
 from a_share_backtesting.streaming_event_study_run import _measure_close_entry_returns, _measure_staged_exit_returns, _measure_trend_runner_returns, _summarize_staged_exit_events, main as streaming_main
 
 
@@ -65,6 +65,22 @@ class TestStreamingEventStudy(unittest.TestCase):
         frames = list(iter_tdx_mainboard_bars(self.source, pd.Timestamp("2025-01-01"), pd.Timestamp("2026-01-31")))
 
         self.assertEqual([frame["code"].iat[0] for frame in frames], ["000001"])
+
+    def test_qfq_csv_iterator_maps_adjusted_ohlc_to_strategy_prices(self) -> None:
+        qfq_path = Path(self.temp_dir.name) / "qfq.csv"
+        pd.DataFrame(
+            [
+                {"date": "2026-06-10", "code": "688200", "open": 467.0, "high": 480.0, "low": 448.0, "close": 467.46, "vol": 1000, "qfq_open": 314.7, "qfq_high": 323.5, "qfq_low": 302.0, "qfq_close": 315.047287},
+                {"date": "2026-06-11", "code": "688200", "open": 312.58, "high": 333.0, "low": 304.73, "close": 315.0, "vol": 1200, "qfq_open": 312.58, "qfq_high": 333.0, "qfq_low": 304.73, "qfq_close": 315.0},
+            ]
+        ).to_csv(qfq_path, index=False)
+
+        frames = list(iter_qfq_csv_bars(qfq_path, pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-30")))
+
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["code"].iloc[0], "688200")
+        self.assertAlmostEqual(frames[0]["close"].iloc[0], 315.047287)
+        self.assertAlmostEqual(frames[0]["raw_close"].iloc[0], 467.46)
 
     def test_collects_events_without_returning_daily_bar_frames(self) -> None:
         records = []
@@ -511,6 +527,53 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertEqual(metadata["bbi_exit_timing"], "same_close")
         self.assertEqual(metadata["stop_loss_return"], -0.08)
         self.assertEqual([level["trigger_return"] for level in metadata["take_profit_levels"]], [0.10, 0.20])
+
+    def test_trend_runner_cli_can_read_qfq_csv_source(self) -> None:
+        qfq_path = Path(self.temp_dir.name) / "qfq.csv"
+        rows = []
+        for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
+            price = 10.0 + index * 0.1
+            rows.append(
+                {
+                    "date": date.strftime("%Y-%m-%d"),
+                    "code": "688001",
+                    "open": price,
+                    "high": price + 0.8,
+                    "low": price - 0.2,
+                    "close": price + 0.1,
+                    "vol": 10000 + index * 100,
+                    "qfq_open": price,
+                    "qfq_high": price + 0.8,
+                    "qfq_low": price - 0.2,
+                    "qfq_close": price + 0.1,
+                }
+            )
+        pd.DataFrame(rows).to_csv(qfq_path, index=False)
+        config = {"analysis_start": "2026-01-01", "analysis_end": "2026-12-31", "variants": ["legacy", "bbi", "b1"], "horizons": [1], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "trend_runner_qfq_output"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.assertEqual(
+            streaming_main(
+                [
+                    "--source", str(qfq_path),
+                    "--source-format", "qfq-csv",
+                    "--config", str(config_path),
+                    "--output", str(output_path),
+                    "--mode", "trend-runner-b1",
+                    "--analysis-start", "2026-06-01",
+                    "--analysis-end", "2026-06-30",
+                    "--horizons", "1",
+                ]
+            ),
+            0,
+        )
+
+        metadata = json.loads((output_path / "trend_runner_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["source_format"], "qfq-csv")
+        self.assertEqual(metadata["price_adjustment"], "qfq")
+        self.assertEqual(metadata["processed_code_count"], 1)
 
     def test_close_entry_cli_uses_stock_pool(self) -> None:
         records = []

@@ -12,7 +12,7 @@ import pandas as pd
 
 from .data_contract import validate_event_config, validate_technical_only_config
 from .statistics import summarize_by_signal_date, summarize_events
-from .streaming_event_study import count_tdx_mainboard_files, collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
+from .streaming_event_study import count_qfq_csv_files, count_tdx_mainboard_files, collect_control_events, collect_signal_events, iter_qfq_csv_bars, iter_tdx_mainboard_bars, sample_control_distribution
 from .signals import build_signal_variants
 
 
@@ -160,6 +160,23 @@ def _load_stock_pool(path: Path) -> set[str]:
 
 def _write_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _iter_price_bars(
+    source: Path,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    source_format: str,
+    code_filter: set[str] | None = None,
+):
+    if source_format == "qfq-csv":
+        return iter_qfq_csv_bars(source, start, end, code_filter=code_filter)
+    return iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter)
+
+
+def _price_adjustment_label(source_format: str) -> str:
+    return "qfq" if source_format == "qfq-csv" else "unadjusted"
 
 
 def _markdown_table(frame: pd.DataFrame) -> str:
@@ -771,12 +788,12 @@ def _summarize_staged_exit_events(events: pd.DataFrame) -> pd.DataFrame:
     return summary[columns]
 
 
-def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output: Path, code_filter: set[str] | None = None, stock_pool_path: Path | None = None) -> int:
+def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output: Path, code_filter: set[str] | None = None, stock_pool_path: Path | None = None, source_format: str = "tdx-day") -> int:
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     horizons = [int(horizon) for horizon in config["horizons"]]
     frames: list[pd.DataFrame] = []
     processed_code_count = 0
-    for bars in iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter):
+    for bars in _iter_price_bars(source, start, end, source_format=source_format, code_filter=code_filter):
         processed_code_count += 1
         signals = build_signal_variants(bars, config)
         measured = _measure_close_entry_returns(signals, horizons, start, end)
@@ -799,6 +816,8 @@ def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output
         "entry_price": "signal_day_close",
         "exit_price": "future_close",
         "drawdown_price": "holding_period_intraday_low",
+        "source_format": source_format,
+        "price_adjustment": _price_adjustment_label(source_format),
         "field_limitations": FIELD_LIMITATIONS,
         "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
         "stock_pool_count": len(code_filter) if code_filter is not None else None,
@@ -822,13 +841,13 @@ def _run_close_entry_b1_backtest(source: Path, config: dict[str, object], output
     return 0
 
 
-def _run_staged_exit_b1_backtest(source: Path, config: dict[str, object], output: Path, code_filter: set[str] | None = None, stock_pool_path: Path | None = None) -> int:
+def _run_staged_exit_b1_backtest(source: Path, config: dict[str, object], output: Path, code_filter: set[str] | None = None, stock_pool_path: Path | None = None, source_format: str = "tdx-day") -> int:
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     horizons = [int(horizon) for horizon in config["horizons"]]
     event_frames: list[pd.DataFrame] = []
     fill_frames: list[pd.DataFrame] = []
     processed_code_count = 0
-    for bars in iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter):
+    for bars in _iter_price_bars(source, start, end, source_format=source_format, code_filter=code_filter):
         processed_code_count += 1
         signals = build_signal_variants(bars, config)
         measured_events, measured_fills = _measure_staged_exit_returns(signals, horizons, start, end)
@@ -858,6 +877,8 @@ def _run_staged_exit_b1_backtest(source: Path, config: dict[str, object], output
         "stop_loss_return": STOP_LOSS_RETURN,
         "same_day_conflict_policy": "stop_loss_before_take_profit",
         "expiry_exit_price": "horizon_day_close",
+        "source_format": source_format,
+        "price_adjustment": _price_adjustment_label(source_format),
         "field_limitations": FIELD_LIMITATIONS,
         "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
         "stock_pool_count": len(code_filter) if code_filter is not None else None,
@@ -896,13 +917,14 @@ def _run_trend_runner_b1_backtest(
     atr_multiple: float = 1.5,
     atr_min_stop: float = 0.06,
     atr_max_stop: float = 0.10,
+    source_format: str = "tdx-day",
 ) -> int:
     start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
     horizons = [int(horizon) for horizon in config["horizons"]]
     event_frames: list[pd.DataFrame] = []
     fill_frames: list[pd.DataFrame] = []
     processed_code_count = 0
-    for bars in iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter):
+    for bars in _iter_price_bars(source, start, end, source_format=source_format, code_filter=code_filter):
         processed_code_count += 1
         signals = build_signal_variants(bars, config)
         measured_events, measured_fills = _measure_trend_runner_returns(
@@ -950,6 +972,8 @@ def _run_trend_runner_b1_backtest(
         "bbi_exit_timing": bbi_exit_timing,
         "same_day_conflict_policy": "stop_loss_before_take_profit_before_trend_exit",
         "expiry_exit_price": "horizon_day_close",
+        "source_format": source_format,
+        "price_adjustment": _price_adjustment_label(source_format),
         "field_limitations": FIELD_LIMITATIONS,
         "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
         "stock_pool_count": len(code_filter) if code_filter is not None else None,
@@ -1007,6 +1031,7 @@ def _control_summary(events: pd.DataFrame, distribution: pd.DataFrame, config: d
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run streaming TDX B1 event study.")
     parser.add_argument("--source", required=True)
+    parser.add_argument("--source-format", choices=["tdx-day", "qfq-csv"], default="tdx-day")
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--progress-interval-seconds", type=float, default=60.0)
@@ -1039,9 +1064,9 @@ def main(argv: list[str] | None = None) -> int:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if args.mode == "close-entry-b1":
-        return _run_close_entry_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
+        return _run_close_entry_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path, source_format=str(args.source_format))
     if args.mode == "staged-exit-b1":
-        return _run_staged_exit_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
+        return _run_staged_exit_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path, source_format=str(args.source_format))
     if args.mode == "trend-runner-b1":
         return _run_trend_runner_b1_backtest(
             source,
@@ -1055,8 +1080,9 @@ def main(argv: list[str] | None = None) -> int:
             atr_multiple=float(args.atr_multiple),
             atr_min_stop=float(args.atr_min_stop),
             atr_max_stop=float(args.atr_max_stop),
+            source_format=str(args.source_format),
         )
-    total_files = count_tdx_mainboard_files(source, code_filter=code_filter)
+    total_files = count_qfq_csv_files(source, code_filter=code_filter) if args.source_format == "qfq-csv" else count_tdx_mainboard_files(source, code_filter=code_filter)
     progress_reporter = ProgressReporter(output / "progress.jsonl", total_files, float(args.progress_interval_seconds))
     progress_reporter.update("signal_audit", force=True)
     signal_audit_rows, signal_audit_code_windows = _write_signal_audit(source, config, output / "signal_audit.csv", progress_reporter, code_filter=code_filter)
