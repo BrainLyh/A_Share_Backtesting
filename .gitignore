@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .worktrees/
 outputs/
+stocks.csv
 data/*.csv
 data/*.metadata.json
 !data/daily_bars_template.csv

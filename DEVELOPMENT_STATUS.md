@@ -1,5 +1,25 @@
 # 开发进度报告
 
+> 2026-07-16 qfq 数据适配器落地记录（优先阅读本节）
+
+## 本次完成
+
+- 新增 `src/a_share_backtesting/qfq.py`，可读取带 `preclose` 的 rustdx CSV 行情，并生成前复权 `qfq_open/qfq_high/qfq_low/qfq_close`。
+- 新增 `src/a_share_backtesting/qfq_run.py`，提供最小 CLI：读取 rustdx 输出，写出完整 qfq 行情 CSV 和除权跳变审计 CSV。
+- 保留原始 OHLC，并新增审计列：`raw_prev_close`、`preclose_to_raw_prev_close_ratio`、`adjustment_jump`、`qfq_scale`、`raw_gap_return`、`adjusted_day_return`。
+- 已用真实 688200 样本验证：2026-06-11 原始 close 相比 2026-06-10 raw close 的跳变约 `-32.6146%`；使用 `D:\apps\tdx\T0002\hq_cache\gbbq` 后，rustdx 输出 `preclose=315.047287`，qfq 适配器识别出比例 `0.6739556`，调整后当日收益约 `-0.0150%`。
+- 这说明 688200 的 2026-06-11 异常不应再被当成真实暴跌输入 ATR、止损、回撤、BBI/KDJ 等指标。
+
+## 当前边界
+
+- 当前实现是 qfq 适配层和审计工具，尚未把 qfq OHLC 正式接入主回测数据读取路径。
+- 当前不提交 `outputs/rustdx_verify/` 和 `outputs/tools/rustdx.exe`，这些仍作为本地验证产物保留。
+- 下一步应把 `price_adjustment=qfq` 接入 B1 close-entry、staged-exit、trend-runner，然后重跑 2026-06-01 至 2026-07-15 股票池结果。
+
+## 验证
+
+- 已运行全量单元测试：`PYTHONPATH=src python -m unittest discover -s tests -v`，54/54 通过。
+
 > 2026-07-16 收尾记录：trend-runner 下一版参数与前复权验证（优先阅读本节）
 
 ## 本次完成
