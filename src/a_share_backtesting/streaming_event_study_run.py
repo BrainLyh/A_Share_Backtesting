@@ -76,7 +76,7 @@ FIELD_LIMITATIONS = [
 ]
 TAKE_PROFIT_LEVELS = [(0.05, 1.0 / 3.0), (0.10, 1.0 / 3.0), (0.15, 1.0)]
 STOP_LOSS_RETURN = -0.05
-TREND_RUNNER_TAKE_PROFIT_LEVELS = [(0.06, 1.0 / 3.0), (0.12, 1.0 / 3.0)]
+TREND_RUNNER_TAKE_PROFIT_LEVELS = [(0.10, 1.0 / 3.0), (0.20, 1.0 / 3.0)]
 TREND_RUNNER_STOP_LOSS_RETURN = -0.08
 TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN = -0.10
 
@@ -480,15 +480,15 @@ def _measure_trend_runner_returns(
     *,
     stop_loss_return: float | str = TREND_RUNNER_STOP_LOSS_RETURN,
     residual_drawdown_return: float = TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN,
-    bbi_exit_timing: str = "next_open",
+    bbi_exit_timing: str = "disabled",
     atr_multiple: float = 1.5,
     atr_min_stop: float = 0.06,
     atr_max_stop: float = 0.10,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if signals.empty or "b1_first_trigger" not in signals.columns:
         return pd.DataFrame(columns=STAGED_EXIT_EVENT_COLUMNS), pd.DataFrame(columns=STAGED_EXIT_FILL_COLUMNS)
-    if bbi_exit_timing not in {"same_close", "next_open"}:
-        raise ValueError("bbi_exit_timing must be same_close or next_open")
+    if bbi_exit_timing not in {"disabled", "same_close", "next_open"}:
+        raise ValueError("bbi_exit_timing must be disabled, same_close or next_open")
     event_rows: list[dict[str, object]] = []
     fill_rows: list[dict[str, object]] = []
     data = signals.sort_values(["code", "date"]).copy()
@@ -629,7 +629,7 @@ def _measure_trend_runner_returns(
                         break
                     close_below_bbi = pd.notna(row.get("bbi")) and float(row["close"]) < float(row["bbi"])
                     consecutive_bbi_breaks = consecutive_bbi_breaks + 1 if close_below_bbi else 0
-                    if consecutive_bbi_breaks >= 2 and remaining_fraction <= 1.0 / 3.0 + 1e-12:
+                    if bbi_exit_timing != "disabled" and consecutive_bbi_breaks >= 2 and remaining_fraction <= 1.0 / 3.0 + 1e-12:
                         sold_fraction = remaining_fraction
                         if bbi_exit_timing == "same_close":
                             fill_row = row
@@ -892,7 +892,7 @@ def _run_trend_runner_b1_backtest(
     stock_pool_path: Path | None = None,
     stop_loss_return: float | str = TREND_RUNNER_STOP_LOSS_RETURN,
     residual_drawdown_return: float = TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN,
-    bbi_exit_timing: str = "next_open",
+    bbi_exit_timing: str = "disabled",
     atr_multiple: float = 1.5,
     atr_min_stop: float = 0.06,
     atr_max_stop: float = 0.10,
@@ -946,7 +946,7 @@ def _run_trend_runner_b1_backtest(
         "atr_min_stop": atr_min_stop if stop_loss_return == "atr" else None,
         "atr_max_stop": atr_max_stop if stop_loss_return == "atr" else None,
         "residual_drawdown_return": residual_drawdown_return,
-        "bbi_exit_rule": "sell residual after two consecutive closes below BBI",
+        "bbi_exit_rule": "disabled" if bbi_exit_timing == "disabled" else "sell residual after two consecutive closes below BBI",
         "bbi_exit_timing": bbi_exit_timing,
         "same_day_conflict_policy": "stop_loss_before_take_profit_before_trend_exit",
         "expiry_exit_price": "horizon_day_close",
@@ -960,11 +960,11 @@ def _run_trend_runner_b1_backtest(
         "",
         f"- Analysis window: {config['analysis_start']} to {config['analysis_end']}",
         "- Entry: signal-day close.",
-        "- Take profit: +6% sells one third, +12% sells one third.",
+        "- Take profit: +10% sells one third, +20% sells one third.",
         "- Residual: last one third exits after trend break, residual drawdown, stop loss, or expiry.",
         f"- Stop loss: {_format_stop_loss_return(stop_loss_return, atr_multiple, atr_min_stop, atr_max_stop)} sells all remaining.",
         f"- Residual drawdown: {residual_drawdown_return:.2%} from peak close sells remaining residual.",
-        f"- BBI exit: two consecutive closes below BBI, timing={bbi_exit_timing}.",
+        f"- BBI exit: {'disabled' if bbi_exit_timing == 'disabled' else 'two consecutive closes below BBI, timing=' + bbi_exit_timing}.",
         "- Scope: technical-only; historical market-cap, ST and suspension filters are not validated.",
         "- Field limitations: " + ", ".join(FIELD_LIMITATIONS),
         "",
@@ -1017,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stock-pool")
     parser.add_argument("--stop-loss-return", default=str(TREND_RUNNER_STOP_LOSS_RETURN))
     parser.add_argument("--residual-drawdown-return", type=float, default=TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN)
-    parser.add_argument("--bbi-exit-timing", choices=["same_close", "next_open"], default="next_open")
+    parser.add_argument("--bbi-exit-timing", choices=["disabled", "same_close", "next_open"], default="disabled")
     parser.add_argument("--atr-multiple", type=float, default=1.5)
     parser.add_argument("--atr-min-stop", type=float, default=0.06)
     parser.add_argument("--atr-max-stop", type=float, default=0.10)
