@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from a_share_backtesting.streaming_event_study import collect_control_events, collect_signal_events, iter_tdx_mainboard_bars, sample_control_distribution
-from a_share_backtesting.streaming_event_study_run import _measure_close_entry_returns, _measure_staged_exit_returns, _summarize_staged_exit_events, main as streaming_main
+from a_share_backtesting.streaming_event_study_run import _measure_close_entry_returns, _measure_staged_exit_returns, _measure_trend_runner_returns, _summarize_staged_exit_events, main as streaming_main
 
 
 class TestStreamingEventStudy(unittest.TestCase):
@@ -283,6 +283,101 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertAlmostEqual(summary.loc[0, "expiry_exit_rate"], 2 / 3)
         self.assertAlmostEqual(summary.loc[0, "worst_intraday_drawdown"], -0.05)
 
+    def test_trend_runner_exits_residual_at_second_bbi_break_close(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30", "2026-07-01", "2026-07-02"]),
+                "code": ["600000"] * 4,
+                "name": ["600000"] * 4,
+                "open": [10.0, 10.2, 10.9, 10.7],
+                "high": [10.0, 10.7, 11.3, 10.9],
+                "low": [10.0, 10.1, 10.6, 10.4],
+                "close": [10.0, 10.6, 11.2, 10.5],
+                "bbi": [9.8, 10.4, 11.4, 10.8],
+                "b1_first_trigger": [True, False, False, False],
+            }
+        )
+
+        events, fills = _measure_trend_runner_returns(
+            signals,
+            [3],
+            pd.Timestamp("2026-06-01"),
+            pd.Timestamp("2026-06-30"),
+            bbi_exit_timing="same_close",
+        )
+
+        self.assertEqual(fills["fill_type"].tolist(), ["take_profit", "take_profit", "bbi_break"])
+        self.assertAlmostEqual(fills.loc[2, "sold_fraction"], 1 / 3)
+        self.assertEqual(fills.loc[2, "fill_date"], pd.Timestamp("2026-07-02"))
+        self.assertAlmostEqual(events.loc[0, "net_return"], (1 / 3) * 0.06 + (1 / 3) * 0.12 + (1 / 3) * 0.05)
+        self.assertEqual(events.loc[0, "exit_reason"], "bbi_break")
+
+    def test_trend_runner_exits_residual_at_next_open_after_second_bbi_break(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30", "2026-07-01", "2026-07-02", "2026-07-03"]),
+                "code": ["600000"] * 5,
+                "name": ["600000"] * 5,
+                "open": [10.0, 10.2, 10.9, 10.7, 10.3],
+                "high": [10.0, 10.7, 11.3, 10.9, 10.5],
+                "low": [10.0, 10.1, 10.6, 10.4, 10.1],
+                "close": [10.0, 10.6, 11.2, 10.5, 10.2],
+                "bbi": [9.8, 10.4, 11.4, 10.8, 10.6],
+                "b1_first_trigger": [True, False, False, False, False],
+            }
+        )
+
+        events, fills = _measure_trend_runner_returns(
+            signals,
+            [4],
+            pd.Timestamp("2026-06-01"),
+            pd.Timestamp("2026-06-30"),
+            bbi_exit_timing="next_open",
+        )
+
+        self.assertEqual(fills["fill_type"].tolist(), ["take_profit", "take_profit", "bbi_break"])
+        self.assertEqual(fills.loc[2, "fill_date"], pd.Timestamp("2026-07-03"))
+        self.assertAlmostEqual(fills.loc[2, "fill_price"], 10.3)
+        self.assertAlmostEqual(events.loc[0, "net_return"], (1 / 3) * 0.06 + (1 / 3) * 0.12 + (1 / 3) * 0.03)
+        self.assertEqual(events.loc[0, "exit_reason"], "bbi_break_next_open")
+
+    def test_trend_runner_atr_stop_can_avoid_fixed_percent_whipsaw(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-29", "2026-06-30"]),
+                "code": ["600000", "600000"],
+                "name": ["600000", "600000"],
+                "open": [10.0, 10.1],
+                "high": [10.8, 10.2],
+                "low": [9.6, 9.1],
+                "close": [10.0, 9.5],
+                "bbi": [9.8, 9.4],
+                "b1_first_trigger": [True, False],
+            }
+        )
+
+        fixed_events, _ = _measure_trend_runner_returns(
+            signals,
+            [1],
+            pd.Timestamp("2026-06-01"),
+            pd.Timestamp("2026-06-30"),
+            stop_loss_return=-0.08,
+        )
+        atr_events, _ = _measure_trend_runner_returns(
+            signals,
+            [1],
+            pd.Timestamp("2026-06-01"),
+            pd.Timestamp("2026-06-30"),
+            stop_loss_return="atr",
+            atr_multiple=1.5,
+            atr_min_stop=0.06,
+            atr_max_stop=0.10,
+        )
+
+        self.assertEqual(fixed_events.loc[0, "exit_reason"], "stop_loss")
+        self.assertEqual(atr_events.loc[0, "exit_reason"], "expiry")
+        self.assertAlmostEqual(atr_events.loc[0, "net_return"], -0.05)
+
     def test_streaming_cli_writes_close_entry_backtest_outputs(self) -> None:
         records = []
         for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
@@ -349,6 +444,42 @@ class TestStreamingEventStudy(unittest.TestCase):
         self.assertEqual(metadata["analysis_start"], "2026-06-01")
         self.assertEqual(metadata["analysis_end"], "2026-06-30")
         self.assertIn("suspension_status_unavailable", metadata["field_limitations"])
+
+    def test_streaming_cli_writes_trend_runner_backtest_outputs(self) -> None:
+        records = []
+        for index, date in enumerate(pd.bdate_range("2026-05-20", periods=45)):
+            price = 1000 + index * 10
+            records.append((int(date.strftime("%Y%m%d")), price, price + 80, price - 20, price + 10, 0.0, 10000 + index * 100, 0))
+        self.write_records("sh/lday/sh600000.day", records)
+        config = {"analysis_start": "2026-01-01", "analysis_end": "2026-12-31", "variants": ["legacy", "bbi", "b1"], "horizons": [1, 2], "require_core_pool": False, "min_market_cap": 0, "j_threshold": 100.0, "pit_lookback": 5, "volume_multiplier": 1.0, "event_notional": 100000, "lot_size": 100, "commission_rate": 0.0, "minimum_commission": 0.0, "sell_stamp_duty_rate": 0.0, "control_iterations": 2, "random_seed": 7, "data_scope_label": "technical_only_no_historical_market_cap_or_st", "price_adjustment": "unadjusted"}
+        config_path = Path(self.temp_dir.name) / "config.json"
+        output_path = Path(self.temp_dir.name) / "trend_runner_output"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.assertEqual(
+            streaming_main(
+                [
+                    "--source", str(self.source),
+                    "--config", str(config_path),
+                    "--output", str(output_path),
+                    "--mode", "trend-runner-b1",
+                    "--analysis-start", "2026-06-01",
+                    "--analysis-end", "2026-06-30",
+                    "--horizons", "1", "2",
+                    "--bbi-exit-timing", "same_close",
+                    "--stop-loss-return", "-0.08",
+                    "--residual-drawdown-return", "-0.10",
+                ]
+            ),
+            0,
+        )
+
+        expected = {"trend_runner_events.csv", "trend_runner_fills.csv", "trend_runner_summary.csv", "trend_runner_metadata.json", "trend_runner_report.md"}
+        self.assertTrue(expected.issubset({path.name for path in output_path.iterdir()}))
+        metadata = json.loads((output_path / "trend_runner_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["mode"], "trend-runner-b1")
+        self.assertEqual(metadata["bbi_exit_timing"], "same_close")
+        self.assertEqual(metadata["stop_loss_return"], -0.08)
 
     def test_close_entry_cli_uses_stock_pool(self) -> None:
         records = []

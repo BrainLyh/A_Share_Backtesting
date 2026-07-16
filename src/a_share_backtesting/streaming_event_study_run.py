@@ -76,6 +76,9 @@ FIELD_LIMITATIONS = [
 ]
 TAKE_PROFIT_LEVELS = [(0.05, 1.0 / 3.0), (0.10, 1.0 / 3.0), (0.15, 1.0)]
 STOP_LOSS_RETURN = -0.05
+TREND_RUNNER_TAKE_PROFIT_LEVELS = [(0.06, 1.0 / 3.0), (0.12, 1.0 / 3.0)]
+TREND_RUNNER_STOP_LOSS_RETURN = -0.08
+TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN = -0.10
 
 
 class ProgressReporter:
@@ -269,6 +272,49 @@ def _fill_row(
     }
 
 
+def _with_atr14(bars: pd.DataFrame) -> pd.DataFrame:
+    data = bars.copy()
+    prior_close = data["close"].shift(1)
+    true_range = pd.concat(
+        [
+            data["high"] - data["low"],
+            (data["high"] - prior_close).abs(),
+            (data["low"] - prior_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    data["atr14"] = true_range.rolling(14, min_periods=1).mean()
+    return data
+
+
+def _resolve_stop_loss_return(
+    signal: pd.Series,
+    entry_price: float,
+    stop_loss_return: float | str,
+    atr_multiple: float,
+    atr_min_stop: float,
+    atr_max_stop: float,
+) -> float:
+    if stop_loss_return != "atr":
+        return float(stop_loss_return)
+    atr = float(signal.get("atr14", float("nan")))
+    if not pd.notna(atr) or entry_price <= 0:
+        stop_distance = float(atr_min_stop)
+    else:
+        stop_distance = min(max(float(atr_multiple) * atr / entry_price, float(atr_min_stop)), float(atr_max_stop))
+    return -abs(stop_distance)
+
+
+def _parse_stop_loss_return(value: str) -> float | str:
+    return "atr" if str(value).strip().lower() == "atr" else float(value)
+
+
+def _format_stop_loss_return(value: float | str, atr_multiple: float, atr_min_stop: float, atr_max_stop: float) -> str:
+    if value == "atr":
+        return f"ATR adaptive: -min(max({atr_multiple} * ATR14 / entry, {atr_min_stop:.2%}), {atr_max_stop:.2%})"
+    return f"{float(value):.2%}"
+
+
 def _measure_staged_exit_returns(
     signals: pd.DataFrame, horizons: list[int], start: pd.Timestamp, end: pd.Timestamp
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -397,6 +443,248 @@ def _measure_staged_exit_returns(
                             float(expiry["close"]),
                             remaining_fraction,
                             remaining_after_expiry,
+                            entry_price,
+                        )
+                    )
+                    remaining_fraction = 0.0
+                    final_exit_date = pd.Timestamp(expiry["date"])
+                    exit_reason = "expiry" if not stop_loss_triggered else exit_reason
+                event_rows.append(
+                    {
+                        "event_id": event_id,
+                        "code": str(code),
+                        "name": signal.get("name", code),
+                        "horizon": horizon,
+                        "signal_date": signal_date,
+                        "entry_price": entry_price,
+                        "final_exit_date": final_exit_date,
+                        "status": "filled",
+                        "exit_reason": exit_reason,
+                        "net_return": float(net_return),
+                        "win": bool(net_return > 0),
+                        "max_intraday_drawdown": float(max_intraday_drawdown),
+                        "position_weighted_drawdown": float(position_weighted_drawdown),
+                        "take_profit_fill_count": len(filled_levels),
+                        "stop_loss_triggered": stop_loss_triggered,
+                        "remaining_fraction_at_expiry": float(expiry_remaining_fraction),
+                    }
+                )
+    return pd.DataFrame(event_rows, columns=STAGED_EXIT_EVENT_COLUMNS), pd.DataFrame(fill_rows, columns=STAGED_EXIT_FILL_COLUMNS)
+
+
+def _measure_trend_runner_returns(
+    signals: pd.DataFrame,
+    horizons: list[int],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    stop_loss_return: float | str = TREND_RUNNER_STOP_LOSS_RETURN,
+    residual_drawdown_return: float = TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN,
+    bbi_exit_timing: str = "next_open",
+    atr_multiple: float = 1.5,
+    atr_min_stop: float = 0.06,
+    atr_max_stop: float = 0.10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if signals.empty or "b1_first_trigger" not in signals.columns:
+        return pd.DataFrame(columns=STAGED_EXIT_EVENT_COLUMNS), pd.DataFrame(columns=STAGED_EXIT_FILL_COLUMNS)
+    if bbi_exit_timing not in {"same_close", "next_open"}:
+        raise ValueError("bbi_exit_timing must be same_close or next_open")
+    event_rows: list[dict[str, object]] = []
+    fill_rows: list[dict[str, object]] = []
+    data = signals.sort_values(["code", "date"]).copy()
+    data["date"] = pd.to_datetime(data["date"])
+    for code, bars in data.groupby("code", sort=False):
+        bars = _with_atr14(bars.reset_index(drop=True))
+        trigger = bars["b1_first_trigger"].fillna(False).astype(bool) & bars["date"].between(start, end)
+        for signal_index in bars.index[trigger]:
+            signal = bars.loc[signal_index]
+            signal_date = pd.Timestamp(signal["date"])
+            entry_price = float(signal["close"])
+            effective_stop_loss_return = _resolve_stop_loss_return(
+                signal,
+                entry_price,
+                stop_loss_return,
+                atr_multiple,
+                atr_min_stop,
+                atr_max_stop,
+            )
+            for horizon in horizons:
+                horizon = int(horizon)
+                event_id = f"{code}:b1_trend_runner:{horizon}:{signal_date:%Y%m%d}:{bbi_exit_timing}"
+                exit_index = int(signal_index) + horizon
+                if exit_index >= len(bars):
+                    event_rows.append(
+                        {
+                            "event_id": event_id,
+                            "code": str(code),
+                            "name": signal.get("name", code),
+                            "horizon": horizon,
+                            "signal_date": signal_date,
+                            "entry_price": entry_price,
+                            "final_exit_date": pd.NaT,
+                            "status": "insufficient_history",
+                            "exit_reason": "insufficient_history",
+                            "net_return": float("nan"),
+                            "win": False,
+                            "max_intraday_drawdown": float("nan"),
+                            "position_weighted_drawdown": float("nan"),
+                            "take_profit_fill_count": 0,
+                            "stop_loss_triggered": False,
+                            "remaining_fraction_at_expiry": float("nan"),
+                        }
+                    )
+                    continue
+                remaining_fraction = 1.0
+                filled_levels: set[float] = set()
+                net_return = 0.0
+                exit_reason = "expiry"
+                final_exit_date = pd.Timestamp(bars.loc[exit_index, "date"])
+                max_intraday_drawdown = 0.0
+                position_weighted_drawdown = 0.0
+                stop_loss_triggered = False
+                expiry_remaining_fraction = 0.0
+                consecutive_bbi_breaks = 0
+                peak_close = entry_price
+                row_index = int(signal_index) + 1
+                while row_index <= exit_index and remaining_fraction > 0:
+                    row = bars.loc[row_index]
+                    fill_date = pd.Timestamp(row["date"])
+                    low_return = float(row["low"]) / entry_price - 1.0
+                    max_intraday_drawdown = min(max_intraday_drawdown, low_return)
+                    position_weighted_drawdown = min(position_weighted_drawdown, low_return * remaining_fraction)
+                    peak_close = max(peak_close, float(row["close"]))
+                    if float(row["low"]) <= entry_price * (1.0 + effective_stop_loss_return):
+                        sold_fraction = remaining_fraction
+                        remaining_fraction = 0.0
+                        fill_price = entry_price * (1.0 + effective_stop_loss_return)
+                        net_return += sold_fraction * effective_stop_loss_return
+                        fill_rows.append(
+                            _fill_row(
+                                event_id,
+                                str(code),
+                                horizon,
+                                signal_date,
+                                fill_date,
+                                "stop_loss",
+                                effective_stop_loss_return,
+                                fill_price,
+                                sold_fraction,
+                                remaining_fraction,
+                                entry_price,
+                            )
+                        )
+                        stop_loss_triggered = True
+                        exit_reason = "stop_loss"
+                        final_exit_date = fill_date
+                        break
+                    for trigger_return, sell_fraction in TREND_RUNNER_TAKE_PROFIT_LEVELS:
+                        if trigger_return in filled_levels or remaining_fraction <= 1.0 / 3.0:
+                            continue
+                        if float(row["high"]) < entry_price * (1.0 + trigger_return):
+                            continue
+                        sold_fraction = min(sell_fraction, remaining_fraction - 1.0 / 3.0)
+                        remaining_fraction -= sold_fraction
+                        fill_price = entry_price * (1.0 + trigger_return)
+                        net_return += sold_fraction * trigger_return
+                        filled_levels.add(trigger_return)
+                        fill_rows.append(
+                            _fill_row(
+                                event_id,
+                                str(code),
+                                horizon,
+                                signal_date,
+                                fill_date,
+                                "take_profit",
+                                trigger_return,
+                                fill_price,
+                                sold_fraction,
+                                remaining_fraction,
+                                entry_price,
+                            )
+                        )
+                    drawdown_trigger = peak_close > entry_price and float(row["low"]) <= peak_close * (1.0 + residual_drawdown_return)
+                    if drawdown_trigger and remaining_fraction <= 1.0 / 3.0 + 1e-12:
+                        sold_fraction = remaining_fraction
+                        fill_price = peak_close * (1.0 + residual_drawdown_return)
+                        fill_return = fill_price / entry_price - 1.0
+                        remaining_fraction = 0.0
+                        net_return += sold_fraction * fill_return
+                        fill_rows.append(
+                            _fill_row(
+                                event_id,
+                                str(code),
+                                horizon,
+                                signal_date,
+                                fill_date,
+                                "residual_drawdown",
+                                residual_drawdown_return,
+                                fill_price,
+                                sold_fraction,
+                                remaining_fraction,
+                                entry_price,
+                            )
+                        )
+                        exit_reason = "residual_drawdown"
+                        final_exit_date = fill_date
+                        break
+                    close_below_bbi = pd.notna(row.get("bbi")) and float(row["close"]) < float(row["bbi"])
+                    consecutive_bbi_breaks = consecutive_bbi_breaks + 1 if close_below_bbi else 0
+                    if consecutive_bbi_breaks >= 2 and remaining_fraction <= 1.0 / 3.0 + 1e-12:
+                        sold_fraction = remaining_fraction
+                        if bbi_exit_timing == "same_close":
+                            fill_row = row
+                            fill_type = "bbi_break"
+                            fill_date = pd.Timestamp(fill_row["date"])
+                            fill_price = float(fill_row["close"])
+                            exit_reason = "bbi_break"
+                        else:
+                            next_index = row_index + 1
+                            if next_index > exit_index:
+                                row_index += 1
+                                continue
+                            fill_row = bars.loc[next_index]
+                            fill_type = "bbi_break"
+                            fill_date = pd.Timestamp(fill_row["date"])
+                            fill_price = float(fill_row["open"])
+                            exit_reason = "bbi_break_next_open"
+                        fill_return = fill_price / entry_price - 1.0
+                        remaining_fraction = 0.0
+                        net_return += sold_fraction * fill_return
+                        fill_rows.append(
+                            _fill_row(
+                                event_id,
+                                str(code),
+                                horizon,
+                                signal_date,
+                                fill_date,
+                                fill_type,
+                                0.0,
+                                fill_price,
+                                sold_fraction,
+                                remaining_fraction,
+                                entry_price,
+                            )
+                        )
+                        final_exit_date = fill_date
+                        break
+                    row_index += 1
+                if remaining_fraction > 0:
+                    expiry = bars.loc[exit_index]
+                    expiry_return = float(expiry["close"]) / entry_price - 1.0
+                    expiry_remaining_fraction = remaining_fraction
+                    net_return += remaining_fraction * expiry_return
+                    fill_rows.append(
+                        _fill_row(
+                            event_id,
+                            str(code),
+                            horizon,
+                            signal_date,
+                            pd.Timestamp(expiry["date"]),
+                            "expiry",
+                            expiry_return,
+                            float(expiry["close"]),
+                            remaining_fraction,
+                            0.0,
                             entry_price,
                         )
                     )
@@ -593,6 +881,101 @@ def _run_staged_exit_b1_backtest(source: Path, config: dict[str, object], output
     ]
     (output / "staged_exit_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     return 0
+
+
+def _run_trend_runner_b1_backtest(
+    source: Path,
+    config: dict[str, object],
+    output: Path,
+    *,
+    code_filter: set[str] | None = None,
+    stock_pool_path: Path | None = None,
+    stop_loss_return: float | str = TREND_RUNNER_STOP_LOSS_RETURN,
+    residual_drawdown_return: float = TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN,
+    bbi_exit_timing: str = "next_open",
+    atr_multiple: float = 1.5,
+    atr_min_stop: float = 0.06,
+    atr_max_stop: float = 0.10,
+) -> int:
+    start, end = pd.Timestamp(config["analysis_start"]), pd.Timestamp(config["analysis_end"])
+    horizons = [int(horizon) for horizon in config["horizons"]]
+    event_frames: list[pd.DataFrame] = []
+    fill_frames: list[pd.DataFrame] = []
+    processed_code_count = 0
+    for bars in iter_tdx_mainboard_bars(source, start, end, code_filter=code_filter):
+        processed_code_count += 1
+        signals = build_signal_variants(bars, config)
+        measured_events, measured_fills = _measure_trend_runner_returns(
+            signals,
+            horizons,
+            start,
+            end,
+            stop_loss_return=stop_loss_return,
+            residual_drawdown_return=residual_drawdown_return,
+            bbi_exit_timing=bbi_exit_timing,
+            atr_multiple=atr_multiple,
+            atr_min_stop=atr_min_stop,
+            atr_max_stop=atr_max_stop,
+        )
+        if not measured_events.empty:
+            event_frames.append(measured_events)
+        if not measured_fills.empty:
+            fill_frames.append(measured_fills)
+    events = pd.concat(event_frames, ignore_index=True) if event_frames else pd.DataFrame(columns=STAGED_EXIT_EVENT_COLUMNS)
+    fills = pd.concat(fill_frames, ignore_index=True) if fill_frames else pd.DataFrame(columns=STAGED_EXIT_FILL_COLUMNS)
+    summary = _summarize_staged_exit_events(events)
+    _write_csv(events, output / "trend_runner_events.csv")
+    _write_csv(fills, output / "trend_runner_fills.csv")
+    _write_csv(summary, output / "trend_runner_summary.csv")
+    metadata = {
+        "mode": "trend-runner-b1",
+        "analysis_start": str(config["analysis_start"]),
+        "analysis_end": str(config["analysis_end"]),
+        "horizons": horizons,
+        "processed_code_count": processed_code_count,
+        "event_count": int(len(events)),
+        "fill_count": int(len(fills)),
+        "entry_price": "signal_day_close",
+        "take_profit_levels": [
+            {"trigger_return": trigger_return, "sell_fraction": sell_fraction}
+            for trigger_return, sell_fraction in TREND_RUNNER_TAKE_PROFIT_LEVELS
+        ],
+        "residual_fraction_policy": "keep_last_one_third_until_trend_exit",
+        "stop_loss_return": stop_loss_return,
+        "atr_multiple": atr_multiple if stop_loss_return == "atr" else None,
+        "atr_min_stop": atr_min_stop if stop_loss_return == "atr" else None,
+        "atr_max_stop": atr_max_stop if stop_loss_return == "atr" else None,
+        "residual_drawdown_return": residual_drawdown_return,
+        "bbi_exit_rule": "sell residual after two consecutive closes below BBI",
+        "bbi_exit_timing": bbi_exit_timing,
+        "same_day_conflict_policy": "stop_loss_before_take_profit_before_trend_exit",
+        "expiry_exit_price": "horizon_day_close",
+        "field_limitations": FIELD_LIMITATIONS,
+        "stock_pool_path": str(stock_pool_path) if stock_pool_path is not None else None,
+        "stock_pool_count": len(code_filter) if code_filter is not None else None,
+    }
+    (output / "trend_runner_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    report = [
+        "# Trend-Runner B1 Backtest",
+        "",
+        f"- Analysis window: {config['analysis_start']} to {config['analysis_end']}",
+        "- Entry: signal-day close.",
+        "- Take profit: +6% sells one third, +12% sells one third.",
+        "- Residual: last one third exits after trend break, residual drawdown, stop loss, or expiry.",
+        f"- Stop loss: {_format_stop_loss_return(stop_loss_return, atr_multiple, atr_min_stop, atr_max_stop)} sells all remaining.",
+        f"- Residual drawdown: {residual_drawdown_return:.2%} from peak close sells remaining residual.",
+        f"- BBI exit: two consecutive closes below BBI, timing={bbi_exit_timing}.",
+        "- Scope: technical-only; historical market-cap, ST and suspension filters are not validated.",
+        "- Field limitations: " + ", ".join(FIELD_LIMITATIONS),
+        "",
+        "## Summary",
+        "",
+        _markdown_table(summary),
+    ]
+    (output / "trend_runner_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    return 0
+
+
 def _control_summary(events: pd.DataFrame, distribution: pd.DataFrame, config: dict[str, object]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     filled = events.loc[events["status"].eq("filled")]
@@ -627,11 +1010,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--progress-interval-seconds", type=float, default=60.0)
-    parser.add_argument("--mode", choices=["event-study", "close-entry-b1", "staged-exit-b1"], default="event-study")
+    parser.add_argument("--mode", choices=["event-study", "close-entry-b1", "staged-exit-b1", "trend-runner-b1"], default="event-study")
     parser.add_argument("--analysis-start")
     parser.add_argument("--analysis-end")
     parser.add_argument("--horizons", nargs="+", type=int)
     parser.add_argument("--stock-pool")
+    parser.add_argument("--stop-loss-return", default=str(TREND_RUNNER_STOP_LOSS_RETURN))
+    parser.add_argument("--residual-drawdown-return", type=float, default=TREND_RUNNER_RESIDUAL_DRAWDOWN_RETURN)
+    parser.add_argument("--bbi-exit-timing", choices=["same_close", "next_open"], default="next_open")
+    parser.add_argument("--atr-multiple", type=float, default=1.5)
+    parser.add_argument("--atr-min-stop", type=float, default=0.06)
+    parser.add_argument("--atr-max-stop", type=float, default=0.10)
     args = parser.parse_args(argv)
     config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
     if args.analysis_start is not None:
@@ -653,6 +1042,20 @@ def main(argv: list[str] | None = None) -> int:
         return _run_close_entry_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
     if args.mode == "staged-exit-b1":
         return _run_staged_exit_b1_backtest(source, config, output, code_filter=code_filter, stock_pool_path=stock_pool_path)
+    if args.mode == "trend-runner-b1":
+        return _run_trend_runner_b1_backtest(
+            source,
+            config,
+            output,
+            code_filter=code_filter,
+            stock_pool_path=stock_pool_path,
+            stop_loss_return=_parse_stop_loss_return(str(args.stop_loss_return)),
+            residual_drawdown_return=float(args.residual_drawdown_return),
+            bbi_exit_timing=str(args.bbi_exit_timing),
+            atr_multiple=float(args.atr_multiple),
+            atr_min_stop=float(args.atr_min_stop),
+            atr_max_stop=float(args.atr_max_stop),
+        )
     total_files = count_tdx_mainboard_files(source, code_filter=code_filter)
     progress_reporter = ProgressReporter(output / "progress.jsonl", total_files, float(args.progress_interval_seconds))
     progress_reporter.update("signal_audit", force=True)
