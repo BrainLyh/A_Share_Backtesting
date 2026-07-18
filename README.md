@@ -42,4 +42,22 @@ $env:PYTHONPATH = "$PWD\src"
 & $py -m a_share_backtesting.event_study_run --data data\daily_bars_technical.csv --config config\event_study_technical_only.json --metadata data\daily_bars_technical.metadata.json --output outputs\event_study_technical_2026h1
 ```
 
+## Intraday portfolio backtest
+
+The intraday mode scans completed five-minute bars at 14:40, 14:45, and
+14:50, enters at the 14:55 close, and runs one chronological account with
+T+1 exits and a maximum of three positions.
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m a_share_backtesting.intraday_portfolio_run `
+  --minute-root D:\apps\tdx\vipdoc `
+  --qfq-source outputs\qfq_20260718\qfq_bars.csv `
+  --stock-pool config\ai_semiconductor_stock_pool_20260715.csv `
+  --config config\intraday_portfolio_20260718.json `
+  --output outputs\intraday_b1_20260601_20260717_ai_semiconductor `
+  --analysis-start 2026-06-01 `
+  --analysis-end 2026-07-17
+```
+
 该版本仅保留沪深主板代码及技术信号，价格使用未复权日线；需在分析起点前保留至少 120 个交易日预热数据。它不验证历史市值大于 100 亿或非 ST 过滤，亦不推断停牌状态。
