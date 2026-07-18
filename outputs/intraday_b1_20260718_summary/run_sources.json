@@ -1,0 +1,22 @@
+{
+  "generated_on": "2026-07-18",
+  "analysis_start": "2026-06-01",
+  "latest_analysis_end": "2026-07-17",
+  "tdx_gbbq_sha256": "52424459e98f76631c1e2ab977dae6f655c6d8405b469a4274194b66e767bfc1",
+  "rustdx_executable_sha256": "3b98c203bc044bab0216e142770dfe7cd4341211b17301e1ff25b04408aeafe0",
+  "ai_qfq_file_sha256": "427c3581d939b0901a500b04b950f6f18bf640a2834e0d1f18604552fb75e8d9",
+  "sector_qfq_file_sha256": "9bde9eb04cc86fc7dab7689c079a0747203433ddac44759c28acac63156aa76f",
+  "ai_minute_source_sha256": "b2544524e873b06562fc82c16ec0c56897b56b0ab2364ef27374fa2b47297a40",
+  "ai_stock_pool_count": 171,
+  "ai_processed_code_count": 170,
+  "sector_unique_code_count": 126,
+  "qfq_last_date": "2026-07-17",
+  "minute_last_date": "2026-07-17",
+  "limitations": [
+    "retrospective_stock_pool_snapshots",
+    "historical_st_status_unavailable",
+    "historical_market_cap_unavailable",
+    "five_minute_intrabar_order_unknown_stop_first",
+    "order_book_queue_unavailable"
+  ]
+}
