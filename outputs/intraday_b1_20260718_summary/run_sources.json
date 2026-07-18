@@ -12,6 +12,9 @@
   "sector_unique_code_count": 126,
   "qfq_last_date": "2026-07-17",
   "minute_last_date": "2026-07-17",
+  "final_backtest_git_revision": "1c16b0ad186d0bf0e3c366ce51cbcc7f8258a98a",
+  "final_backtest_git_dirty": false,
+  "final_output_root": "outputs/intraday_b1_final_verified_20260718",
   "limitations": [
     "retrospective_stock_pool_snapshots",
     "historical_st_status_unavailable",
