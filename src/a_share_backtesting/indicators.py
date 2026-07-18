@@ -41,3 +41,23 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
 def add_grouped_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     groups = [add_indicators(group) for _, group in frame.groupby("code", sort=False)]
     return pd.concat(groups, ignore_index=True) if groups else frame.copy()
+
+
+def add_atr14(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add the simple rolling ATR14 used by the frozen trend-runner."""
+    data = frame.sort_values(["code", "date"]).copy()
+    groups = []
+    for _, group in data.groupby("code", sort=False):
+        bars = group.copy()
+        prior_close = bars["close"].shift(1)
+        true_range = pd.concat(
+            [
+                bars["high"] - bars["low"],
+                (bars["high"] - prior_close).abs(),
+                (bars["low"] - prior_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        bars["atr14"] = true_range.rolling(14, min_periods=1).mean()
+        groups.append(bars)
+    return pd.concat(groups).sort_index() if groups else data
