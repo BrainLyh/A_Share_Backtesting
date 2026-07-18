@@ -121,6 +121,19 @@ class IntradaySignalTests(unittest.TestCase):
 
         self.assertEqual(selected["code"].tolist(), ["600003", "600001", "600002"])
 
+    def test_scheme_a_rejects_missing_prior_day_state(self) -> None:
+        scans = pd.DataFrame(
+            [
+                {"date": "2026-07-17", "code": "600001", "scan_time": "14:40", "b1_signal": True, "signal_strength": 1.0},
+                {"date": "2026-07-17", "code": "600001", "scan_time": "14:50", "b1_signal": True, "signal_strength": 2.0},
+            ]
+        )
+
+        selected = select_scheme_a_candidates(scans, {}, set())
+
+        self.assertTrue(selected.empty)
+        self.assertEqual(selected.attrs["rejections"][0]["reason"], "missing_prior_day_state")
+
 
 if __name__ == "__main__":
     unittest.main()

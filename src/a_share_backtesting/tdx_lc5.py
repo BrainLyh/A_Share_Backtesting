@@ -10,7 +10,12 @@ import pandas as pd
 
 _RECORD = struct.Struct("<HHfffffII")
 _FILENAME = re.compile(r"^(sh|sz|bj)(\d{6})$", re.IGNORECASE)
-_REQUIRED_TIMES = {"14:40", "14:45", "14:50", "14:55"}
+_EXPECTED_TIMES = {
+    f"{minute // 60:02d}:{minute % 60:02d}"
+    for start, stop in ((9 * 60 + 35, 11 * 60 + 30), (13 * 60 + 5, 15 * 60))
+    for minute in range(start, stop + 1, 5)
+}
+_REQUIRED_TIMES = {"14:40", "14:45", "14:50", "14:55", "15:00"}
 
 
 def _market_for_code(code: str) -> str | None:
@@ -103,7 +108,16 @@ def audit_lc5_frame(frame: pd.DataFrame) -> list[str]:
         label = f"{code} {pd.Timestamp(date):%Y-%m-%d}"
         if len(day) != 48:
             errors.append(f"{label}: expected 48 bars, found {len(day)}")
-        missing = sorted(_REQUIRED_TIMES - set(day["time"].astype(str)))
+        actual_times = set(day["time"].astype(str))
+        missing_grid = sorted(_EXPECTED_TIMES - actual_times)
+        unexpected_grid = sorted(actual_times - _EXPECTED_TIMES)
+        if missing_grid or unexpected_grid:
+            missing_text = ",".join(missing_grid) or "-"
+            unexpected_text = ",".join(unexpected_grid) or "-"
+            errors.append(
+                f"{label}: invalid trading time grid missing={missing_text} unexpected={unexpected_text}"
+            )
+        missing = sorted(_REQUIRED_TIMES - actual_times)
         if missing:
             errors.append(f"{label}: missing required bars {','.join(missing)}")
     return errors

@@ -15,6 +15,7 @@ from .intraday_execution import (
     commission,
     entry_fill,
     process_exit_bar,
+    validate_execution_config,
 )
 from .intraday_signals import scan_intraday_b1, select_scheme_a_candidates
 from .signals import build_signals
@@ -85,9 +86,44 @@ def _full_daily_b1_states(daily_by_code: Mapping[str, pd.DataFrame], config: dic
     return states
 
 
-def _prior_state(states: pd.Series, date: pd.Timestamp) -> bool:
+def _prior_state(states: pd.Series, date: pd.Timestamp) -> bool | None:
     prior = states.loc[states.index < date]
-    return bool(prior.iloc[-1]) if not prior.empty else False
+    return bool(prior.iloc[-1]) if not prior.empty else None
+
+
+def cached_scan_candidate_provider(
+    scans: pd.DataFrame,
+    daily_by_code: Mapping[str, pd.DataFrame],
+    signal_config: dict[str, Any],
+) -> CandidateProvider:
+    """Build a dynamic candidate provider from frozen per-code scan results."""
+    required = {"date", "code", "scan_time", "b1_signal", "signal_strength", "atr14"}
+    missing = required - set(scans.columns)
+    if missing:
+        raise ValueError(f"scan source missing columns: {', '.join(sorted(missing))}")
+    cached = scans.copy()
+    cached["date"] = pd.to_datetime(cached["date"]).dt.normalize()
+    cached["code"] = cached["code"].astype(str).str.strip().str.zfill(6)
+    cached["b1_signal"] = cached["b1_signal"].astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+    daily = {
+        str(code).zfill(6): frame.sort_values("date").reset_index(drop=True)
+        for code, frame in daily_by_code.items()
+    }
+    daily_states = _full_daily_b1_states(daily, signal_config)
+
+    def provider(date: pd.Timestamp, held_codes: set[str]) -> pd.DataFrame:
+        normalized_date = pd.Timestamp(date).normalize()
+        day_scans = cached.loc[cached["date"].eq(normalized_date)].copy()
+        if day_scans.empty:
+            return pd.DataFrame(columns=[*cached.columns, "first_trigger_time"])
+        prior_states = {
+            code: _prior_state(daily_states[code], normalized_date)
+            for code in day_scans["code"].drop_duplicates()
+            if code in daily_states
+        }
+        return select_scheme_a_candidates(day_scans, prior_states, held_codes)
+
+    return provider
 
 
 def _default_candidates(
@@ -99,7 +135,7 @@ def _default_candidates(
     daily_states: Mapping[str, pd.Series],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     scan_frames: list[pd.DataFrame] = []
-    prior_states: dict[str, bool] = {}
+    prior_states: dict[str, bool | None] = {}
     for code in sorted(minute_days):
         daily = daily_by_code.get(code)
         minute_day = minute_days[code]
@@ -135,6 +171,7 @@ def run_intraday_portfolio(
     *,
     candidate_provider: CandidateProvider | None = None,
 ) -> PortfolioResult:
+    validate_execution_config(execution_config)
     start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
     daily = {str(code).zfill(6): frame.sort_values("date").reset_index(drop=True) for code, frame in daily_by_code.items()}
     minutes = {str(code).zfill(6): frame.sort_values("timestamp").reset_index(drop=True) for code, frame in minute_by_code.items()}
@@ -165,6 +202,7 @@ def run_intraday_portfolio(
 
     date_index = {date: index for index, date in enumerate(all_dates)}
     for date in all_dates:
+        exited_today: set[str] = set()
         minute_days = {
             code: frame.loc[pd.to_datetime(frame["date"]).eq(date)].copy()
             for code, frame in minutes.items()
@@ -186,7 +224,24 @@ def run_intraday_portfolio(
                 execution_bar["is_expiry_close"] = bool(
                     expiry_dates.get(position.position_id) == date and timestamp.strftime("%H:%M") == "15:00"
                 )
-                result = process_exit_bar(position, pending.get(position.position_id, []), execution_bar, execution_config)
+                position_pending = pending.get(position.position_id, [])
+                expiry_date = expiry_dates.get(position.position_id)
+                if (
+                    expiry_date is not None
+                    and date > expiry_date
+                    and not any(order.reason == "expiry" for order in position_pending)
+                ):
+                    adjusted_open = float(raw_bar["open"]) * current_scale
+                    position_pending = [
+                        *position_pending,
+                        PendingExit(
+                            "expiry",
+                            position.remaining_shares,
+                            adjusted_open,
+                            pd.Timestamp(expiry_date) + pd.Timedelta(hours=15),
+                        ),
+                    ]
+                result = process_exit_bar(position, position_pending, execution_bar, execution_config)
                 for reason in result.rejections:
                     rejection_rows.append({"timestamp": timestamp, "code": code, "side": "sell", "reason": reason})
                 for raw_fill in result.fills:
@@ -222,6 +277,7 @@ def run_intraday_portfolio(
                     )
                     del open_positions[code]
                     pending.pop(position.position_id, None)
+                    exited_today.add(code)
 
             time_label = timestamp.strftime("%H:%M")
             if time_label == "14:55":
@@ -234,6 +290,15 @@ def run_intraday_portfolio(
                     day_candidates = candidate_provider(date, set(open_positions))
                 if day_candidates is None:
                     day_candidates = pd.DataFrame()
+                for selection_rejection in day_candidates.attrs.get("rejections", []):
+                    rejection_rows.append(
+                        {
+                            "timestamp": timestamp,
+                            "code": str(selection_rejection["code"]).zfill(6),
+                            "side": "buy",
+                            "reason": selection_rejection["reason"],
+                        }
+                    )
                 if not day_candidates.empty:
                     day_candidates = day_candidates.copy()
                     day_candidates["code"] = day_candidates["code"].astype(str).str.zfill(6)
@@ -246,6 +311,9 @@ def run_intraday_portfolio(
                 pre_entry_nav = cash + market_value
                 for _, candidate in day_candidates.iterrows() if not day_candidates.empty else []:
                     code = str(candidate["code"]).zfill(6)
+                    if code in exited_today:
+                        rejection_rows.append({"timestamp": timestamp, "code": code, "side": "buy", "reason": "rearm_required"})
+                        continue
                     if code in open_positions:
                         rejection_rows.append({"timestamp": timestamp, "code": code, "side": "buy", "reason": "position_already_open"})
                         continue
@@ -277,6 +345,8 @@ def run_intraday_portfolio(
                     if cash < -0.01:
                         raise ValueError("cash reconciliation failed: negative cash")
                     open_positions[code] = result.position
+                    if len(open_positions) > 3:
+                        raise AssertionError("open position count exceeded the hard limit of 3")
                     pending[result.position.position_id] = []
                     horizon_index = date_index[date] + execution_config.horizon_days
                     expiry_dates[result.position.position_id] = all_dates[horizon_index] if horizon_index < len(all_dates) else None
@@ -295,16 +365,22 @@ def run_intraday_portfolio(
                 current_bar = last_bars.get(code)
                 if current_bar is None:
                     continue
-                marked += _adjusted_value(position, current_bar, "close")
+                market_value = _adjusted_value(position, current_bar, "close")
+                marked += market_value
                 low_column = "close" if code in newly_entered else "low"
-                marked_low += _adjusted_value(position, current_bar, low_column)
+                low_market_value = _adjusted_value(position, current_bar, low_column)
+                marked_low += low_market_value
+                entry_cost = -entry_fills[position.position_id].cash_delta
+                realized = sum(fill.cash_delta for fill in sell_fills.get(position.position_id, []))
                 position_rows.append(
                     {
                         "timestamp": timestamp,
                         "position_id": position.position_id,
                         "code": code,
                         "remaining_shares": position.remaining_shares,
-                        "market_value": _adjusted_value(position, current_bar, "close"),
+                        "market_value": market_value,
+                        "position_return": (realized + market_value) / entry_cost - 1.0,
+                        "position_return_low": (realized + low_market_value) / entry_cost - 1.0,
                     }
                 )
             nav = cash + marked
@@ -349,16 +425,28 @@ def run_intraday_portfolio(
                 "holding_days": date_index.get(all_dates[-1], 0) - date_index.get(position.entry_date, 0) if all_dates else 0,
             }
         )
+    positions_frame = _records(position_rows)
+    trades_frame = _records(trade_rows)
+    if not trades_frame.empty:
+        path_mae = (
+            positions_frame.groupby("position_id")["position_return_low"].min()
+            if not positions_frame.empty and "position_return_low" in positions_frame
+            else pd.Series(dtype=float)
+        )
+        trades_frame["maximum_adverse_excursion"] = [
+            min(float(row.net_return), float(path_mae.get(row.position_id, row.net_return)))
+            for row in trades_frame.itertuples()
+        ]
     return PortfolioResult(
         scans=_records(scan_rows),
         candidates=_records(candidate_rows),
         orders=_records(order_rows),
         fills=_records(fill_rows),
-        positions=_records(position_rows),
-        trades=_records(trade_rows),
+        positions=positions_frame,
+        trades=trades_frame,
         nav_5m=nav_5m,
         nav_daily=nav_daily,
-        rejections=_records(rejection_rows),
+        rejections=_records(rejection_rows).reindex(columns=["timestamp", "code", "side", "reason"]),
         data_audit=pd.DataFrame(),
         open_positions=dict(open_positions),
     )
@@ -366,7 +454,26 @@ def run_intraday_portfolio(
 
 def summarize_portfolio(result: PortfolioResult, initial_cash: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     if result.nav_5m.empty:
-        portfolio = pd.DataFrame([{"initial_cash": initial_cash, "total_net_return": float("nan")}])
+        portfolio = pd.DataFrame(
+            [
+                {
+                    "initial_cash": initial_cash,
+                    "final_nav": initial_cash,
+                    "total_net_return": 0.0,
+                    "max_drawdown_5m": 0.0,
+                    "max_drawdown_low": 0.0,
+                    "max_drawdown_daily": 0.0,
+                    "average_exposure": 0.0,
+                    "max_exposure": 0.0,
+                    "capital_utilization": 0.0,
+                    "max_positions": 0,
+                    "turnover": 0.0,
+                    "commission": 0.0,
+                    "stamp_duty": 0.0,
+                    "slippage_cost": 0.0,
+                }
+            ]
+        )
     else:
         nav = result.nav_5m["nav"].astype(float)
         close_peaks = nav.cummax()
@@ -387,6 +494,7 @@ def summarize_portfolio(result: PortfolioResult, initial_cash: float) -> tuple[p
                     "max_drawdown_daily": _drawdown(result.nav_daily["nav"].astype(float)),
                     "average_exposure": float(exposure.mean()),
                     "max_exposure": float(exposure.max()),
+                    "capital_utilization": float(result.nav_5m["gross_exposure"].astype(float).mean() / initial_cash),
                     "max_positions": int(result.nav_5m["positions"].max()),
                     "turnover": gross / initial_cash,
                     "commission": commission_cost,
@@ -399,6 +507,22 @@ def summarize_portfolio(result: PortfolioResult, initial_cash: float) -> tuple[p
     closed = trades.loc[trades["status"].eq("closed")].copy() if "status" in trades else pd.DataFrame()
     wins = closed.loc[closed["net_pnl"] > 0, "net_pnl"] if not closed.empty else pd.Series(dtype=float)
     losses = closed.loc[closed["net_pnl"] < 0, "net_pnl"] if not closed.empty else pd.Series(dtype=float)
+    ordered = closed.sort_values("entry_timestamp") if "entry_timestamp" in closed else closed
+    maximum_consecutive_losses = 0
+    current_loss_run = 0
+    for is_loss in ordered["net_pnl"].lt(0) if not ordered.empty else []:
+        current_loss_run = current_loss_run + 1 if is_loss else 0
+        maximum_consecutive_losses = max(maximum_consecutive_losses, current_loss_run)
+    fill_ids: set[str] = set()
+    if not result.fills.empty and {"position_id", "reason"}.issubset(result.fills.columns):
+        fill_ids = set(
+            result.fills.loc[
+                result.fills["reason"].astype(str).str.startswith("take_profit_"), "position_id"
+            ].astype(str)
+        )
+    closed_ids = set(closed["position_id"].astype(str)) if "position_id" in closed else set()
+    mae = pd.to_numeric(closed.get("maximum_adverse_excursion", pd.Series(dtype=float)), errors="coerce").dropna()
+    exit_reason = closed.get("exit_reason", pd.Series(index=closed.index, dtype=str)).astype(str)
     trade = pd.DataFrame(
         [
             {
@@ -411,6 +535,14 @@ def summarize_portfolio(result: PortfolioResult, initial_cash: float) -> tuple[p
                 "payoff_ratio": float(wins.mean() / abs(losses.mean())) if not wins.empty and not losses.empty else float("nan"),
                 "expectancy": float(closed["net_pnl"].mean()) if not closed.empty else float("nan"),
                 "average_holding_days": float(closed["holding_days"].mean()) if not closed.empty else float("nan"),
+                "maximum_consecutive_losses": maximum_consecutive_losses,
+                "take_profit_trade_rate": float(len(fill_ids & closed_ids) / len(closed)) if not closed.empty else float("nan"),
+                "stop_exit_rate": float(exit_reason.eq("stop_loss").mean()) if not closed.empty else float("nan"),
+                "residual_exit_rate": float(exit_reason.eq("residual_drawdown").mean()) if not closed.empty else float("nan"),
+                "expiry_exit_rate": float(exit_reason.eq("expiry").mean()) if not closed.empty else float("nan"),
+                "overtime_exit_rate": float(exit_reason.eq("overtime_exit").mean()) if not closed.empty else float("nan"),
+                "mean_maximum_adverse_excursion": float(mae.mean()) if not mae.empty else float("nan"),
+                "worst_maximum_adverse_excursion": float(mae.min()) if not mae.empty else float("nan"),
             }
         ]
     )

@@ -212,7 +212,7 @@ Expected: import failure for the CLI module.
 
 - [ ] **Step 3: Implement loading, output, and reporting**
 
-Load only pool codes, retain 180 business-day daily warmup, join per-day qfq scale, validate minute/day close alignment, write CSVs with UTF-8 BOM, write stable JSON with source hashes and Git revision, and generate a concise Markdown report with limitations.
+Load only pool codes, retain 180 actual daily observations before the analysis start, join per-day qfq scale and explicit price limits, validate the exact five-minute grid and minute/day close alignment, write CSVs with UTF-8 BOM, write stable JSON with source hashes, repository-relative Git revision, and dirty state, and generate a concise Markdown report with limitations.
 
 - [ ] **Step 4: Verify focused and full suites**
 
@@ -253,7 +253,7 @@ Run the CLI for 2026-06-01 through 2026-07-15 and through 2026-07-17. Preserve m
 
 - [ ] **Step 3: Run frozen sensitivity checks**
 
-Keep signal and exit parameters fixed. Run only execution sensitivities: participation unlimited versus 10%, slippage 0/5/10bp, and max positions 1/2/3. Report these as capacity/execution checks, not strategy optimization.
+Keep signal and exit parameters fixed. Run only execution sensitivities that preserve hard strategy limits: slippage 0/5/10bp and max positions 1/2/3. Audit every fill against the fixed 10% participation cap. Report these as capacity/execution checks, not strategy optimization.
 
 - [ ] **Step 4: Apply walk-forward discipline if strategy quality is weak**
 

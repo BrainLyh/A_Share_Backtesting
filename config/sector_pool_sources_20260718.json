@@ -1,0 +1,34 @@
+{
+  "generated_on": "2026-07-18",
+  "pools": [
+    {
+      "file": "innovative_drug_931440_stock_pool_20260630.csv",
+      "theme": "innovative_drug",
+      "index_code": "931440",
+      "index_name": "CSI Brand Name Drug 30 Index",
+      "constituent_date": "2026-06-30",
+      "source_url": "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/closeweight/931440closeweight.xls",
+      "count": 30
+    },
+    {
+      "file": "battery_931719_stock_pool_20260630.csv",
+      "theme": "battery",
+      "index_code": "931719",
+      "index_name": "CSI Battery Theme Index",
+      "constituent_date": "2026-06-30",
+      "source_url": "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/closeweight/931719closeweight.xls",
+      "count": 50
+    },
+    {
+      "file": "humanoid_robot_proxy_980022_stock_pool_20260717.csv",
+      "theme": "humanoid_robot_proxy",
+      "index_code": "980022",
+      "index_name": "CNI Robot Industry Index",
+      "constituent_date": "2026-07-17",
+      "source_url": "https://www.gffunds.com.cn/proxy/pcflist/159050?_time=20260718",
+      "count": 50,
+      "limitation": "Robot-industry proxy rather than a pure humanoid-robot classification; the current index is concentrated in robot bodies and core components."
+    }
+  ],
+  "backtest_limitation": "These are retrospective constituent snapshots and introduce survivorship and membership look-ahead bias before their stated constituent dates."
+}

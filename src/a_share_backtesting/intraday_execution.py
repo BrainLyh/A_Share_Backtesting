@@ -28,6 +28,13 @@ class ExecutionConfig:
     horizon_days: int = 5
 
 
+def validate_execution_config(config: ExecutionConfig) -> None:
+    if not 1 <= config.max_positions <= 3:
+        raise ValueError("max_positions must be between 1 and 3")
+    if not 0 < config.participation_rate <= 0.10:
+        raise ValueError("participation_rate must be greater than 0 and no more than 0.10")
+
+
 @dataclass(frozen=True)
 class Fill:
     code: str

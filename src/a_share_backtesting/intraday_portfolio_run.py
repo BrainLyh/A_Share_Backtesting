@@ -10,8 +10,8 @@ from typing import Any
 
 import pandas as pd
 
-from .intraday_execution import ExecutionConfig
-from .intraday_portfolio import run_intraday_portfolio, summarize_portfolio
+from .intraday_execution import ExecutionConfig, validate_execution_config
+from .intraday_portfolio import cached_scan_candidate_provider, run_intraday_portfolio, summarize_portfolio
 from .tdx_lc5 import audit_lc5_frame, find_lc5_path, read_tdx_lc5_file
 
 
@@ -23,6 +23,7 @@ REQUIRED_OUTPUTS = (
     "fills.csv",
     "positions.csv",
     "trades.csv",
+    "rejections.csv",
     "nav_5m.csv",
     "nav_daily.csv",
     "portfolio_summary.csv",
@@ -31,8 +32,34 @@ REQUIRED_OUTPUTS = (
     "run_manifest.json",
     "report.md",
 )
+EMPTY_CSV_COLUMNS = {
+    "signal_scans.csv": [
+        "date", "code", "scan_time", "b1_signal", "eligible", "signal_strength", "j", "prior_j",
+        "bbi", "dif", "volume", "volume_ma", "atr14", "qfq_scale",
+    ],
+    "candidates.csv": [
+        "date", "code", "scan_time", "b1_signal", "eligible", "signal_strength", "j", "prior_j",
+        "bbi", "dif", "volume", "volume_ma", "atr14", "qfq_scale", "first_trigger_time",
+    ],
+    "orders.csv": ["timestamp", "code", "side", "reason", "status"],
+    "fills.csv": [
+        "position_id", "code", "timestamp", "side", "reason", "shares", "raw_price", "adjusted_price",
+        "gross_notional", "commission", "stamp_duty", "slippage_cost", "cash_delta",
+    ],
+    "positions.csv": [
+        "timestamp", "position_id", "code", "remaining_shares", "market_value", "position_return",
+        "position_return_low",
+    ],
+    "trades.csv": [
+        "position_id", "code", "entry_timestamp", "exit_timestamp", "status", "exit_reason", "entry_cost",
+        "net_proceeds", "net_pnl", "net_return", "holding_days", "maximum_adverse_excursion",
+    ],
+    "rejections.csv": ["timestamp", "code", "side", "reason"],
+    "nav_5m.csv": ["timestamp", "date", "cash", "gross_exposure", "positions", "nav", "nav_low"],
+    "nav_daily.csv": ["timestamp", "date", "cash", "gross_exposure", "positions", "nav", "nav_low"],
+}
 LIMITATIONS = [
-    "retrospective_20260715_stock_pool",
+    "retrospective_stock_pool_snapshot",
     "historical_st_status_unavailable",
     "historical_market_cap_unavailable",
     "five_minute_intrabar_order_unknown_stop_first",
@@ -46,6 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--qfq-source", required=True)
     parser.add_argument("--stock-pool", required=True)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--scan-source")
     parser.add_argument("--output", required=True)
     parser.add_argument("--analysis-start", required=True)
     parser.add_argument("--analysis-end", required=True)
@@ -94,10 +122,14 @@ def _load_qfq(source: Path, codes: set[str], start: pd.Timestamp, end: pd.Timest
         data["volume"] = data["vol"]
     data["date"] = pd.to_datetime(data["date"], errors="raise")
     data["code"] = data["code"].astype(str).str.strip().str.zfill(6)
-    data = data.loc[data["code"].isin(codes) & data["date"].between(start - pd.offsets.BDay(180), end)].copy()
+    data = data.loc[data["code"].isin(codes) & data["date"].le(end)].copy()
     if data.empty:
         raise ValueError("qfq source has no rows for the selected pool and window")
-    for column in ("open", "high", "low", "close", "qfq_open", "qfq_high", "qfq_low", "qfq_close", "volume"):
+    numeric_columns = [
+        "open", "high", "low", "close", "qfq_open", "qfq_high", "qfq_low", "qfq_close", "volume",
+        *[column for column in ("upper_limit", "lower_limit") if column in data.columns],
+    ]
+    for column in numeric_columns:
         data[column] = pd.to_numeric(data[column], errors="raise")
     if "qfq_scale" not in data.columns:
         data["qfq_scale"] = data["qfq_close"] / data["close"]
@@ -105,6 +137,12 @@ def _load_qfq(source: Path, codes: set[str], start: pd.Timestamp, end: pd.Timest
     if "preclose" not in data.columns:
         data["preclose"] = data.groupby("code", sort=False)["close"].shift(1)
     data["preclose"] = pd.to_numeric(data["preclose"], errors="coerce")
+    windows = []
+    for _, group in data.sort_values(["code", "date"]).groupby("code", sort=False):
+        warmup = group.loc[group["date"] < start].tail(180)
+        analysis = group.loc[group["date"].between(start, end)]
+        windows.append(pd.concat([warmup, analysis], ignore_index=True))
+    data = pd.concat(windows, ignore_index=True) if windows else data.iloc[0:0].copy()
     for column in ("open", "high", "low", "close"):
         data[f"raw_{column}"] = data[column]
         data[column] = data[f"qfq_{column}"]
@@ -134,7 +172,11 @@ def _load_minutes(
             audit_rows.append({"code": code, "date": pd.NaT, "reason": "missing_lc5_file"})
             continue
         selected_paths.append(path)
-        frame = read_tdx_lc5_file(path)
+        try:
+            frame = read_tdx_lc5_file(path)
+        except (OSError, ValueError):
+            audit_rows.append({"code": code, "date": pd.NaT, "reason": "lc5_parse_error"})
+            continue
         frame = frame.loc[pd.to_datetime(frame["date"]).between(start, end)].copy()
         if frame.empty:
             audit_rows.append({"code": code, "date": pd.NaT, "reason": "no_lc5_rows_in_window"})
@@ -147,7 +189,11 @@ def _load_minutes(
         if code not in daily:
             audit_rows.append({"code": code, "date": pd.NaT, "reason": "missing_qfq_code"})
             continue
-        join = daily[code][["date", "qfq_scale", "preclose", "raw_close"]].copy()
+        join_columns = [
+            "date", "qfq_scale", "preclose", "raw_close",
+            *[column for column in ("upper_limit", "lower_limit") if column in daily[code].columns],
+        ]
+        join = daily[code][join_columns].copy()
         frame = frame.merge(join, on="date", how="left", validate="many_to_one")
         for date in frame.loc[frame["qfq_scale"].isna(), "date"].drop_duplicates():
             bad_dates.add(pd.Timestamp(date))
@@ -170,7 +216,7 @@ def _execution_config(config: dict[str, Any]) -> ExecutionConfig:
         field: config.get(field, getattr(defaults, field))
         for field in defaults.__dataclass_fields__
     }
-    return ExecutionConfig(
+    execution = ExecutionConfig(
         initial_cash=float(values["initial_cash"]),
         max_positions=int(values["max_positions"]),
         target_fraction=float(values["target_fraction"]),
@@ -189,13 +235,26 @@ def _execution_config(config: dict[str, Any]) -> ExecutionConfig:
         residual_drawdown=float(values["residual_drawdown"]),
         horizon_days=int(values["horizon_days"]),
     )
+    validate_execution_config(execution)
+    return execution
 
 
-def _git_revision() -> str | None:
+def _git_state() -> tuple[str | None, bool | None]:
+    repository = Path(__file__).resolve().parents[2]
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+        revision = subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", str(repository), "status", "--porcelain", "--untracked-files=no"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return revision, bool(status.strip())
     except (OSError, subprocess.CalledProcessError):
-        return None
+        return None, None
 
 
 def _write_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -229,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     qfq_source = Path(args.qfq_source)
     pool_path = Path(args.stock_pool)
     config_path = Path(args.config)
+    scan_source = Path(args.scan_source) if args.scan_source else None
     output = Path(args.output)
     start, end = pd.Timestamp(args.analysis_start).normalize(), pd.Timestamp(args.analysis_end).normalize()
     if start > end:
@@ -239,7 +299,24 @@ def main(argv: list[str] | None = None) -> int:
     daily = _load_qfq(qfq_source, set(codes), start, end)
     minutes, data_audit, minute_paths = _load_minutes(minute_root, codes, daily, start, end)
     execution = _execution_config(config)
-    result = run_intraday_portfolio(daily, minutes, config, execution, start, end)
+    cached_scans = None
+    candidate_provider = None
+    if scan_source is not None:
+        cached_scans = pd.read_csv(scan_source, dtype={"code": str})
+        cached_scans["date"] = pd.to_datetime(cached_scans["date"]).dt.normalize()
+        cached_scans = cached_scans.loc[cached_scans["date"].between(start, end)].copy()
+        candidate_provider = cached_scan_candidate_provider(cached_scans, daily, config)
+    result = run_intraday_portfolio(
+        daily,
+        minutes,
+        config,
+        execution,
+        start,
+        end,
+        candidate_provider=candidate_provider,
+    )
+    if cached_scans is not None:
+        result.scans = cached_scans
     result.data_audit = data_audit
     portfolio_summary, trade_summary = summarize_portfolio(result, execution.initial_cash)
     comparison = portfolio_summary.assign(mode="intraday_portfolio", start=start, end=end)
@@ -252,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         "fills.csv": result.fills,
         "positions.csv": result.positions,
         "trades.csv": result.trades,
+        "rejections.csv": result.rejections,
         "nav_5m.csv": result.nav_5m,
         "nav_daily.csv": result.nav_daily,
         "portfolio_summary.csv": portfolio_summary,
@@ -259,7 +337,10 @@ def main(argv: list[str] | None = None) -> int:
         "comparison.csv": comparison,
     }
     for filename, frame in frames.items():
+        if frame.empty and len(frame.columns) == 0 and filename in EMPTY_CSV_COLUMNS:
+            frame = pd.DataFrame(columns=EMPTY_CSV_COLUMNS[filename])
         _write_csv(frame, output / filename)
+    git_revision, git_dirty = _git_state()
     manifest = {
         "mode": "intraday-b1-portfolio",
         "analysis_start": f"{start:%Y-%m-%d}",
@@ -271,11 +352,14 @@ def main(argv: list[str] | None = None) -> int:
         "qfq_source_sha256": _sha256_paths(_source_paths(qfq_source)),
         "stock_pool_sha256": _sha256_file(pool_path),
         "config_sha256": _sha256_file(config_path),
+        "scan_source": str(scan_source.resolve()) if scan_source is not None else None,
+        "scan_source_sha256": _sha256_file(scan_source) if scan_source is not None else None,
         "minute_source_sha256": _sha256_paths(minute_paths),
         "last_minute_date": max((frame["date"].max() for frame in minutes.values()), default=pd.NaT).strftime("%Y-%m-%d")
         if minutes
         else None,
-        "git_revision": _git_revision(),
+        "git_revision": git_revision,
+        "git_dirty": git_dirty,
         "python_version": sys.version,
         "execution_config": execution.__dict__,
         "limitations": LIMITATIONS,

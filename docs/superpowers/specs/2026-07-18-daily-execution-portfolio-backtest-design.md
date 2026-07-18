@@ -12,12 +12,14 @@ The existing `close-entry-b1`, `staged-exit-b1`, and `trend-runner-b1` modes rem
 - Scheme A confirmation: a code enters the intraday candidate set at its first true B1 scan and must still satisfy B1 at 14:50.
 - Enter during 14:50-14:55 using the 14:55 five-minute close plus 5 basis points of adverse buy slippage.
 - A position bought on D cannot be sold until D+1.
-- Hold at most three codes. Each new position targets one third of account NAV at entry.
+- Hold at most three codes. The confirmed canonical mode targets one third of account NAV at entry. A separately labeled risk-control sensitivity targets one quarter and leaves at least 25% cash when three positions are full.
 - Rank excess candidates by first trigger time ascending, 14:50 signal strength descending, then code ascending.
 - Preserve the latest trend-runner exits: +10% sells one third, +20% sells one third, ATR stop sells all remaining, and the final one third exits on a 15% completed-close drawdown or D+5 expiry.
 - Use five-minute bars for exits. Within one bar, process stop loss before take profit before residual drawdown before expiry.
 - Apply a 10% five-minute volume participation cap to every fill.
 - Use CNY 1,000,000 initial cash and no leverage.
+
+The CLI rejects `max_positions` outside 1-3 and `participation_rate` above 10%. These are hard strategy constraints, not permissive tuning parameters.
 
 ## Data scope
 
@@ -42,13 +44,13 @@ Before a run, validate that:
 
 - every `.lc5` file length is divisible by 32 bytes,
 - timestamps are unique and strictly increasing,
-- complete trading days contain the expected 48 bars,
+- complete trading days contain the exact expected 48 timestamps, including 15:00,
 - scan and entry bars exist,
 - OHLC relationships are valid,
 - the 15:00 raw minute close agrees with the raw daily close within tick tolerance,
 - qfq scales are finite and positive.
 
-Malformed days are rejected and written to the data audit. No bar is synthesized.
+Malformed files and days are rejected and written to the data audit without aborting other codes. No bar is synthesized.
 
 ### Research windows
 
@@ -57,7 +59,7 @@ Produce two canonical runs:
 1. Same-window comparison through 2026-07-15, matching the prior published report end date.
 2. Latest-data run through 2026-07-17.
 
-Open positions at the data boundary are marked to market and remain excluded from closed-trade win rate. Also report a mature cohort containing only entries whose D+5 lifecycle can be observed completely.
+Open positions at the data boundary are marked to market and remain excluded from closed-trade win rate. Closed-trade metrics are the observable-lifecycle cohort; the report always shows the open count beside them.
 
 ## Intraday B1 signal
 
@@ -74,7 +76,7 @@ Append this provisional bar to completed qfq daily history and calculate BBI, KD
 
 ### First-trigger state
 
-A code can become a candidate only when the prior completed trading day's B1 state is false. A code already held cannot create another entry. After exit, the code must have at least one completed B1-false day before another first trigger is possible.
+A code can become a candidate only when the prior completed trading day's B1 state is available and false. Missing prior-day state is rejected as `missing_prior_day_state`, not treated as false. A code already held cannot create another entry. After exit, the code cannot re-enter on the same day. A later entry still requires the immediately prior completed daily B1 state to be false.
 
 Candidates that lose B1 by 14:50, exceed capacity, lack cash, or cannot trade are rejected for D and do not remain queued for the next day.
 
@@ -146,9 +148,9 @@ Entry shares are 100-share lots. The first and second target slices are each the
 
 ## Corporate-action accounting
 
-Store adjusted economic units separately from current raw physical shares. At each timestamp, qfq scale reconciles adjusted market value with raw executable shares. This preserves total-return continuity across ex-right and dividend dates while still applying participation and fees in raw notional space.
+Store share quantities in entry-date raw-share units. At each timestamp, the ratio between the current qfq scale and entry qfq scale converts marked value, executable notional, modeled slippage, and the volume cap back to that entry basis. This preserves total-return continuity without pretending that the backtester separately posted cash dividends or changed the physical share ledger.
 
-Every position crossing a qfq adjustment jump is flagged. The ledger reconciles cash, adjusted market value, raw executable notional, and the total-return contribution. It does not claim that cash dividends and bonus shares were separately posted events.
+The qfq input audit identifies adjustment jumps before the portfolio run. The ledger reconciles cash, adjusted market value, executable notional, and the total-return contribution, but does not currently add a per-position corporate-action flag.
 
 ## Portfolio ledger
 
@@ -177,7 +179,7 @@ The report separates commission, stamp duty, and slippage drag. Brokerage commis
 
 ## Tradeability
 
-Price-limit checks operate in raw space. Infer board limits from code family and raw preclose, with tick rounding, and recognize 5%, 10%, 20%, and 30% one-price locks when historical ST classification is unavailable.
+Price-limit checks operate in raw space. When explicit limit columns are unavailable, a one-price bar is compared with the known 5%, 10%, 20%, and 30% ratios around raw preclose within tick tolerance. This recognizes likely locks but does not reconstruct the complete historical board or ST regime.
 
 - Zero-volume or absent bars cannot fill.
 - A one-price upper-limit 14:55 bar blocks entry.
@@ -212,6 +214,8 @@ Closed-trade metrics:
 
 Open positions are included in NAV return but excluded from closed-trade win rate. Annualized statistics are secondary and omitted when the observation window is shorter than 90 calendar days.
 
+Capital utilization is the time average of five-minute gross exposure divided by initial cash. Average exposure instead divides each five-minute gross exposure by contemporaneous NAV.
+
 ## Comparisons
 
 Separate signal and portfolio effects with three layers:
@@ -233,6 +237,7 @@ Each run writes:
 - `fills.csv`
 - `positions.csv`
 - `trades.csv`
+- `rejections.csv`
 - `nav_5m.csv`
 - `nav_daily.csv`
 - `portfolio_summary.csv`
@@ -259,7 +264,7 @@ Every run enforces:
 - timestamps are chronological,
 - every rejected order has a reason.
 
-The CLI fails before final summaries when reconciliation or chronology checks fail. Incomplete diagnostics are retained only in a run-specific temporary directory and labeled incomplete.
+The CLI fails before final summaries on negative cash or non-finite NAV, while unit tests cover the remaining chronology and fill invariants. Run manifests record the repository-relative Git revision and dirty flag. Together with rejection files and input hashes, they provide the audit trail for completed runs.
 
 ## Testing
 

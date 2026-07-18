@@ -94,7 +94,7 @@ def scan_intraday_b1(
 
 def select_scheme_a_candidates(
     scans: pd.DataFrame,
-    prior_day_b1: Mapping[str, bool],
+    prior_day_b1: Mapping[str, bool | None],
     held_codes: Collection[str],
 ) -> pd.DataFrame:
     """Select persistent first-trigger candidates and apply deterministic ranking."""
@@ -102,6 +102,7 @@ def select_scheme_a_candidates(
         return scans.assign(first_trigger_time=pd.Series(dtype=str))
     held = {str(code).zfill(6) for code in held_codes}
     candidates: list[dict[str, object]] = []
+    rejections: list[dict[str, object]] = []
     data = scans.copy()
     data["code"] = data["code"].astype(str).str.zfill(6)
     for (date, code), group in data.groupby(["date", "code"], sort=False):
@@ -109,7 +110,10 @@ def select_scheme_a_candidates(
         final = group.loc[group["scan_time"].astype(str).eq("14:50")]
         if true_rows.empty or final.empty or not bool(final.iloc[-1]["b1_signal"]):
             continue
-        if bool(prior_day_b1.get(code, False)) or code in held:
+        if code not in prior_day_b1 or prior_day_b1[code] is None:
+            rejections.append({"date": pd.Timestamp(date), "code": code, "reason": "missing_prior_day_state"})
+            continue
+        if bool(prior_day_b1[code]) or code in held:
             continue
         true_rows["_order"] = true_rows["scan_time"].map(_SCAN_ORDER)
         first_trigger_time = str(true_rows.sort_values("_order").iloc[0]["scan_time"])
@@ -119,11 +123,15 @@ def select_scheme_a_candidates(
         row["first_trigger_time"] = first_trigger_time
         candidates.append(row)
     if not candidates:
-        return pd.DataFrame(columns=[*scans.columns, "first_trigger_time"])
+        result = pd.DataFrame(columns=[*scans.columns, "first_trigger_time"])
+        result.attrs["rejections"] = rejections
+        return result
     result = pd.DataFrame(candidates)
     result["_first_order"] = result["first_trigger_time"].map(_SCAN_ORDER)
-    return (
+    result = (
         result.sort_values(["_first_order", "signal_strength", "code"], ascending=[True, False, True])
         .drop(columns="_first_order")
         .reset_index(drop=True)
     )
+    result.attrs["rejections"] = rejections
+    return result

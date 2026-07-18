@@ -86,7 +86,27 @@ class TestTdxLc5Reader(unittest.TestCase):
         errors = audit_lc5_frame(frame)
 
         self.assertIn("600246 2026-07-17: expected 48 bars, found 3", errors)
-        self.assertIn("600246 2026-07-17: missing required bars 14:45", errors)
+        self.assertTrue(any("missing required bars" in error and "14:45" in error for error in errors))
+
+    def test_audit_rejects_wrong_48_bar_grid_and_requires_close(self) -> None:
+        morning = pd.date_range("2026-07-17 09:35", "2026-07-17 11:30", freq="5min")
+        afternoon = pd.date_range("2026-07-17 13:05", "2026-07-17 15:00", freq="5min")
+        times = [timestamp.strftime("%H:%M") for timestamp in [*morning, *afternoon]]
+        times[0] = "09:30"
+        frame = pd.DataFrame(
+            {
+                "code": "600246",
+                "date": pd.Timestamp("2026-07-17"),
+                "time": times,
+            }
+        )
+
+        errors = audit_lc5_frame(frame)
+
+        self.assertTrue(any("invalid trading time grid" in error for error in errors))
+        frame = frame.loc[frame["time"].ne("15:00")].copy()
+        errors = audit_lc5_frame(frame)
+        self.assertIn("600246 2026-07-17: missing required bars 15:00", errors)
 
 
 if __name__ == "__main__":
