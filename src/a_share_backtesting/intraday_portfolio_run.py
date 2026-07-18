@@ -12,7 +12,7 @@ import pandas as pd
 
 from .intraday_execution import ExecutionConfig, validate_execution_config
 from .intraday_portfolio import cached_scan_candidate_provider, run_intraday_portfolio, summarize_portfolio
-from .tdx_lc5 import audit_lc5_frame, find_lc5_path, read_tdx_lc5_file
+from .tdx_lc5 import audit_lc5_records, find_lc5_path, read_tdx_lc5_file
 
 
 REQUIRED_OUTPUTS = (
@@ -182,10 +182,10 @@ def _load_minutes(
             audit_rows.append({"code": code, "date": pd.NaT, "reason": "no_lc5_rows_in_window"})
             continue
         bad_dates: set[pd.Timestamp] = set()
-        for issue in audit_lc5_frame(frame):
-            _, date_text, reason = issue.split(" ", 2)
-            bad_dates.add(pd.Timestamp(date_text))
-            audit_rows.append({"code": code, "date": pd.Timestamp(date_text), "reason": reason})
+        for issue in audit_lc5_records(frame):
+            issue_date = pd.Timestamp(issue["date"])
+            bad_dates.add(issue_date)
+            audit_rows.append({"code": code, "date": issue_date, "reason": issue["reason"]})
         if code not in daily:
             audit_rows.append({"code": code, "date": pd.NaT, "reason": "missing_qfq_code"})
             continue

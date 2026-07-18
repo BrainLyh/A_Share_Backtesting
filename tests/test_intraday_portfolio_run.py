@@ -180,6 +180,32 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         self.assertIn("capital_utilization", summary.columns)
         self.assertEqual(summary.loc[0, "final_nav"], 1_000_000.0)
 
+    def test_loader_audits_incomplete_lc5_day_structurally(self) -> None:
+        self.write_inputs()
+        lc5 = self.minute_root / "sh" / "fzline" / "sh600001.lc5"
+        lc5.write_bytes(lc5.read_bytes()[:-32])
+        daily = _load_qfq(
+            self.qfq_path,
+            {"600001"},
+            pd.Timestamp("2026-07-17"),
+            pd.Timestamp("2026-07-17"),
+        )
+
+        minutes, audit, _ = _load_minutes(
+            self.minute_root,
+            ["600001"],
+            daily,
+            pd.Timestamp("2026-07-17"),
+            pd.Timestamp("2026-07-17"),
+        )
+
+        self.assertNotIn("600001", minutes)
+        self.assertEqual(audit["date"].dropna().tolist(), [pd.Timestamp("2026-07-17")] * 3)
+        self.assertEqual(
+            set(audit["reason"]),
+            {"unexpected_bar_count", "invalid_trading_time_grid", "missing_required_bars"},
+        )
+
     def test_cli_writes_complete_reconciled_artifacts(self) -> None:
         self.write_inputs()
 

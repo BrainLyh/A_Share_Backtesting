@@ -8,7 +8,7 @@
 - 已实现单一时间顺序账户：初始资金 100 万元、最多三只、A 股 T+1、100 股整手、五分钟成交量 10% 上限、佣金/最低佣金/印花税/双边滑点、同一股票不加仓且当日退出后不重进。
 - 已实现确认版退出：ATR14 止损区间 6%-10%，+10%/+20% 各卖原始仓位约 1/3，剩余仓位从已完成五分钟收盘高点回撤 15% 或 D+5 到期退出；同一根五分钟 K 线先止损后止盈。
 - 已新增 Tongdaxin `.lc5` 解析和审计、盘中 B1 扫描、成交模型、组合账本、CLI、冻结扫描复跑、拒单明细、逐笔最大不利变动、连续亏损和退出率指标。
-- 独立代码审查提出的八项问题已全部修正：最多三仓和 10% 参与率改为硬约束；空结果汇总 schema 固定；`.lc5` 精确校验 48 个时间戳并容错坏文件；缺失前日状态明确拒绝；显式涨跌停价透传；新增资金利用率；manifest 从模块仓库记录 Git revision 和 dirty 状态。
+- 独立代码审查提出的八项问题已全部修正：最多三仓和 10% 参与率改为硬约束；空结果汇总 schema 固定；`.lc5` 精确校验 48 个时间戳并容错坏文件；缺失前日状态明确拒绝；显式涨跌停价透传；新增资金利用率；manifest 从模块仓库记录 Git revision 和 dirty 状态。真实机器人池暴露的审计文本解析问题也已改为结构化 reason 记录并补回归测试。
 - 设计与实施计划：`docs/superpowers/specs/2026-07-18-daily-execution-portfolio-backtest-design.md`、`docs/superpowers/plans/2026-07-18-intraday-b1-portfolio.md`。
 - 结果解读：`docs/research/2026-07-18-intraday-b1-portfolio-results.md`；轻量外发汇总位于 `outputs/intraday_b1_20260718_summary/`，未提交本地原始五分钟数据、完整逐笔账本和大体积 qfq 快照。
 
@@ -43,7 +43,7 @@
 
 ## 验证状态
 
-- 完整单元测试：`python -m unittest discover -s tests -v`，93/93 通过；`compileall` 和 `git diff --check` 同时通过。
+- 完整单元测试：`python -m unittest discover -s tests -v`，94/94 通过；`compileall` 和 `git diff --check` 同时通过。
 - 冻结 `signal_scans.csv` 的缓存复跑与原始扫描复跑逐项一致：候选、订单、成交、持仓、交易、五分钟净值和汇总均匹配。
 - 可执行基线提交为 `c39e7ea`；独立代码审查已闭环。剩余步骤是从干净提交重跑正式产物、复核汇总、提交报告并推送。
 

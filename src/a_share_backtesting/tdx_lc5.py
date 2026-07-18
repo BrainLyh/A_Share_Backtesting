@@ -101,23 +101,50 @@ def find_lc5_path(root: Path, code: str) -> Path | None:
     return path if path.is_file() else None
 
 
-def audit_lc5_frame(frame: pd.DataFrame) -> list[str]:
-    """Return completeness issues without mutating or synthesizing minute bars."""
-    errors: list[str] = []
+def audit_lc5_records(frame: pd.DataFrame) -> list[dict[str, object]]:
+    """Return structured completeness issues for minute-bar loading."""
+    records: list[dict[str, object]] = []
     for (code, date), day in frame.groupby(["code", "date"], sort=True):
-        label = f"{code} {pd.Timestamp(date):%Y-%m-%d}"
+        normalized_date = pd.Timestamp(date).normalize()
         if len(day) != 48:
-            errors.append(f"{label}: expected 48 bars, found {len(day)}")
+            records.append(
+                {
+                    "code": str(code),
+                    "date": normalized_date,
+                    "reason": "unexpected_bar_count",
+                    "detail": f"expected 48 bars, found {len(day)}",
+                }
+            )
         actual_times = set(day["time"].astype(str))
         missing_grid = sorted(_EXPECTED_TIMES - actual_times)
         unexpected_grid = sorted(actual_times - _EXPECTED_TIMES)
         if missing_grid or unexpected_grid:
             missing_text = ",".join(missing_grid) or "-"
             unexpected_text = ",".join(unexpected_grid) or "-"
-            errors.append(
-                f"{label}: invalid trading time grid missing={missing_text} unexpected={unexpected_text}"
+            records.append(
+                {
+                    "code": str(code),
+                    "date": normalized_date,
+                    "reason": "invalid_trading_time_grid",
+                    "detail": f"invalid trading time grid missing={missing_text} unexpected={unexpected_text}",
+                }
             )
         missing = sorted(_REQUIRED_TIMES - actual_times)
         if missing:
-            errors.append(f"{label}: missing required bars {','.join(missing)}")
-    return errors
+            records.append(
+                {
+                    "code": str(code),
+                    "date": normalized_date,
+                    "reason": "missing_required_bars",
+                    "detail": f"missing required bars {','.join(missing)}",
+                }
+            )
+    return records
+
+
+def audit_lc5_frame(frame: pd.DataFrame) -> list[str]:
+    """Return human-readable completeness issues without synthesizing bars."""
+    return [
+        f"{record['code']} {pd.Timestamp(record['date']):%Y-%m-%d}: {record['detail']}"
+        for record in audit_lc5_records(frame)
+    ]
