@@ -107,4 +107,71 @@ Two legacy portfolio fixtures (open and expiry-closed states) were run with the 
 
 ## Concerns
 
-No unresolved functional concerns. Overlay transitions require the corresponding effective 5-minute bar (14:55 or 09:35) to be present for a position to execute at the specified trigger, which matches the supplied portfolio-bar contract.
+No unresolved functional concerns. A held code without the effective 14:55 or 09:35 bar now remains pending and exits from its next executable bar's adjusted open.
+
+## Critical Review Fix: Missing Per-Holding Transition Bar
+
+### Finding and Root Cause
+
+The original overlay discovered a down transition from the union of portfolio timestamps, but attempted to create each held position's `market_regime_exit` only after finding that position's exact timestamp bar. A holding with no 14:55 or 09:35 row skipped the entire exit path, lost liquidation intent, and could coexist with new entries after a later up transition.
+
+The fix creates regime intent for every open position before per-code bar processing. If the held code has the exact effective bar, the pending order retains the adjusted close/open trigger. If it does not, the order retains the transition timestamp with no trigger price; Task 2 therefore prices its eventual fill from the next executable bar's adjusted open. Existing remainders are still not replaced.
+
+### RED
+
+Added heterogeneous-timestamp regressions for both execution modes. In each case another code supplies the global transition timestamp, the held code lacks its effective bar, a later up event occurs, and a candidate attempts entry before the holding can reconcile.
+
+Command:
+
+```text
+python -m unittest tests.test_intraday_portfolio.PortfolioChronologyTests -v
+```
+
+Initial result:
+
+```text
+test_next_session_regime_intent_survives_missing_transition_bar_until_reconciled ... FAIL
+test_same_day_regime_intent_survives_missing_transition_bar_until_reconciled ... FAIL
+
+AssertionError: Lists differ: [] != [Timestamp('2026-07-04 15:00:00')]
+AssertionError: Lists differ: [] != [Timestamp('2026-07-03 15:00:00')]
+
+Ran 16 tests in 0.409s
+FAILED (failures=2)
+```
+
+The empty sell lists demonstrate that no regime intent survived the missing effective bars.
+
+### GREEN
+
+The first implementation pass made the same-day regression pass and exposed a `KeyError: 'timestamp'` when a held code had no rows for the entire next-session effective date. Guarding that lookup with the existing `code in minute_days` pattern completed the same root-cause fix.
+
+Final chronology result:
+
+```text
+python -m unittest tests.test_intraday_portfolio.PortfolioChronologyTests -v
+Ran 16 tests in 0.406s
+OK
+```
+
+Both regressions verify that no fill or trigger price is synthesized at the missing transition bar, the later candidate receives `market_regime_off`, the real deferred fill uses the next executable bar's adjusted open, and entry resumes only on the following candidate cycle after reconciliation.
+
+### Review-Fix Verification
+
+Focused portfolio module:
+
+```text
+python -m unittest tests.test_intraday_portfolio -v
+Ran 18 tests in 0.450s
+OK
+```
+
+Full suite:
+
+```text
+python -m unittest discover -s tests -v
+Ran 114 tests in 1.868s
+OK
+```
+
+No execution, schedule, CLI, or `.gitignore` files were changed.

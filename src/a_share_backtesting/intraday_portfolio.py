@@ -216,6 +216,31 @@ def run_intraday_portfolio(
         for timestamp in timestamps:
             newly_entered: set[str] = set()
             regime_transition = market_regime.event_at(timestamp) if market_regime is not None else None
+            if regime_transition is not None and regime_transition.event == "down":
+                trigger_column = "close" if regime_transition.execution_mode == "same_day_1455" else "open"
+                for code, position in open_positions.items():
+                    position_pending = pending.get(position.position_id, [])
+                    if any(order.reason == "market_regime_exit" for order in position_pending):
+                        continue
+                    raw_bar = _bar_at(minute_days[code], timestamp) if code in minute_days else None
+                    # A deferred Task 2 order ignores this sentinel and prices from its next bar's open.
+                    trigger_price = float("nan")
+                    if raw_bar is not None:
+                        current_scale = float(raw_bar.get("qfq_scale", 1.0))
+                        trigger_price = float(
+                            raw_bar.get(
+                                f"qfq_{trigger_column}",
+                                float(raw_bar[trigger_column]) * current_scale,
+                            )
+                        )
+                    pending[position.position_id] = [
+                        PendingExit(
+                            "market_regime_exit",
+                            position.remaining_shares,
+                            trigger_price,
+                            timestamp,
+                        )
+                    ]
             for code in sorted(list(open_positions)):
                 raw_bar = _bar_at(minute_days.get(code, pd.DataFrame()), timestamp) if code in minute_days else None
                 if raw_bar is None:
@@ -229,26 +254,6 @@ def run_intraday_portfolio(
                     expiry_dates.get(position.position_id) == date and timestamp.strftime("%H:%M") == "15:00"
                 )
                 position_pending = pending.get(position.position_id, [])
-                if (
-                    regime_transition is not None
-                    and regime_transition.event == "down"
-                    and not any(order.reason == "market_regime_exit" for order in position_pending)
-                ):
-                    trigger_column = "close" if regime_transition.execution_mode == "same_day_1455" else "open"
-                    trigger_price = float(
-                        raw_bar.get(
-                            f"qfq_{trigger_column}",
-                            float(raw_bar[trigger_column]) * current_scale,
-                        )
-                    )
-                    position_pending = [
-                        PendingExit(
-                            "market_regime_exit",
-                            position.remaining_shares,
-                            trigger_price,
-                            timestamp,
-                        )
-                    ]
                 expiry_date = expiry_dates.get(position.position_id)
                 if (
                     expiry_date is not None

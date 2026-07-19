@@ -193,6 +193,142 @@ class PortfolioChronologyTests(unittest.TestCase):
         self.assertIn(blocked_code, result.candidates["code"].tolist())
         self.assertIn("market_regime_off", set(result.rejections["reason"]))
 
+    def test_same_day_regime_intent_survives_missing_transition_bar_until_reconciled(self) -> None:
+        held_code, candidate_code = "600001", "600002"
+        dates = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04"]
+        held_minutes = minute_frame(
+            held_code,
+            dates,
+            {(dates[2], "15:00"): (9.4, 10.8, 9.3, 10.6)},
+        )
+        held_minutes = held_minutes.loc[
+            ~(
+                held_minutes["date"].eq(pd.Timestamp(dates[1]))
+                & held_minutes["time"].eq("14:55")
+            )
+            & ~(
+                held_minutes["date"].eq(pd.Timestamp(dates[2]))
+                & held_minutes["time"].ne("15:00")
+            )
+        ].copy()
+        held_minutes.loc[
+            held_minutes["timestamp"].eq(pd.Timestamp("2026-07-02 15:00")), "volume"
+        ] = 0
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": dates[1], "event": "down", "label": "risk_off"},
+                    {"signal_date": dates[2], "event": "up", "label": "risk_on"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {
+                held_code: daily_frame(held_code, dates),
+                candidate_code: daily_frame(candidate_code, dates),
+            },
+            {
+                held_code: held_minutes,
+                candidate_code: minute_frame(candidate_code, dates),
+            },
+            {},
+            ExecutionConfig(),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for(
+                {
+                    dates[0]: [held_code],
+                    dates[2]: [candidate_code],
+                    dates[3]: [candidate_code],
+                }
+            ),
+            market_regime=schedule,
+        )
+
+        regime_sells = result.fills.loc[result.fills["reason"].eq("market_regime_exit")]
+        self.assertEqual(regime_sells["timestamp"].tolist(), [pd.Timestamp("2026-07-03 15:00")])
+        self.assertAlmostEqual(regime_sells.iloc[0]["adjusted_price"], 9.4 * 0.9995)
+        blocked = result.rejections.loc[
+            result.rejections["timestamp"].eq(pd.Timestamp("2026-07-03 14:55"))
+            & result.rejections["code"].eq(candidate_code)
+        ]
+        self.assertEqual(blocked["reason"].tolist(), ["market_regime_off"])
+        candidate_buys = result.fills.loc[
+            result.fills["side"].eq("buy") & result.fills["code"].eq(candidate_code)
+        ]
+        self.assertEqual(candidate_buys["timestamp"].tolist(), [pd.Timestamp("2026-07-04 14:55")])
+
+    def test_next_session_regime_intent_survives_missing_transition_bar_until_reconciled(self) -> None:
+        held_code, candidate_code = "600001", "600002"
+        dates = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"]
+        times = ["09:35", "14:40", "14:45", "14:50", "14:55", "15:00"]
+        held_minutes = minute_frame(
+            held_code,
+            dates,
+            {(dates[3], "15:00"): (9.4, 10.8, 9.3, 10.6)},
+            times,
+        )
+        held_minutes = held_minutes.loc[
+            ~held_minutes["date"].eq(pd.Timestamp(dates[2]))
+            & ~(
+                held_minutes["date"].eq(pd.Timestamp(dates[3]))
+                & held_minutes["time"].ne("15:00")
+            )
+        ].copy()
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "next_session_0935",
+                "events": [
+                    {"signal_date": dates[1], "event": "down", "label": "risk_off"},
+                    {"signal_date": dates[2], "event": "up", "label": "risk_on"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {
+                held_code: daily_frame(held_code, dates),
+                candidate_code: daily_frame(candidate_code, dates),
+            },
+            {
+                held_code: held_minutes,
+                candidate_code: minute_frame(candidate_code, dates, times=times),
+            },
+            {},
+            ExecutionConfig(),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for(
+                {
+                    dates[0]: [held_code],
+                    dates[3]: [candidate_code],
+                    dates[4]: [candidate_code],
+                }
+            ),
+            market_regime=schedule,
+        )
+
+        regime_sells = result.fills.loc[result.fills["reason"].eq("market_regime_exit")]
+        self.assertEqual(regime_sells["timestamp"].tolist(), [pd.Timestamp("2026-07-04 15:00")])
+        self.assertAlmostEqual(regime_sells.iloc[0]["adjusted_price"], 9.4 * 0.9995)
+        blocked = result.rejections.loc[
+            result.rejections["timestamp"].eq(pd.Timestamp("2026-07-04 14:55"))
+            & result.rejections["code"].eq(candidate_code)
+        ]
+        self.assertEqual(blocked["reason"].tolist(), ["market_regime_off"])
+        candidate_buys = result.fills.loc[
+            result.fills["side"].eq("buy") & result.fills["code"].eq(candidate_code)
+        ]
+        self.assertEqual(candidate_buys["timestamp"].tolist(), [pd.Timestamp("2026-07-05 14:55")])
+
     def test_regime_remainder_survives_repeated_down_and_up_before_entries_resume(self) -> None:
         held_code, candidate_code = "600001", "600002"
         dates = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"]
