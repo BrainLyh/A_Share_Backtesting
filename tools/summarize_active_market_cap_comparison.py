@@ -631,6 +631,20 @@ def _percent(value: object) -> str:
     return "n/a" if math.isnan(number) else f"{number:.2%}"
 
 
+def _percentage_points(value: object) -> str:
+    number = float(value)
+    return "n/a" if math.isnan(number) else f"{abs(number) * 100.0:.2f} percentage points"
+
+
+def _same_day_difference(value: object) -> str:
+    delta = float(value)
+    if delta > SUMMARY_TOLERANCE:
+        return f"a same-day advantage of {_percentage_points(delta)}"
+    if delta < -SUMMARY_TOLERANCE:
+        return f"a same-day disadvantage of {_percentage_points(delta)}"
+    return "no same-day versus next-session return difference (0.00 percentage points)"
+
+
 def _metric_line(label: str, row: pd.Series) -> str:
     return (
         f"- {label}: return {_percent(row['total_net_return'])}; "
@@ -641,6 +655,229 @@ def _metric_line(label: str, row: pd.Series) -> str:
         f"(denominator {int(row['win_rate_denominator'])}); "
         f"capital utilization {_percent(row['capital_utilization'])}; "
         f"turnover {float(row['turnover']):.2f}x."
+    )
+
+
+def _timed_rows(comparison: pd.DataFrame, pool: str | None = None) -> pd.DataFrame:
+    rows = comparison.loc[comparison["timing_variant"] != "baseline"].copy()
+    if pool is not None:
+        rows = rows.loc[rows["pool"] == pool].copy()
+    rows["total_trade_count"] = (
+        rows["closed_trade_count"].astype(int) + rows["open_trade_count"].astype(int)
+    )
+    rows["is_zero_trade"] = rows["total_trade_count"].eq(0)
+    return rows
+
+
+def _baseline_row(comparison: pd.DataFrame, pool: str, position: str) -> pd.Series:
+    rows = comparison.loc[
+        (comparison["pool"] == pool)
+        & (comparison["position_config"] == position)
+        & (comparison["timing_variant"] == "baseline")
+    ]
+    if len(rows) != 1:
+        raise ValueError(
+            f"report requires one baseline row for {(pool, position)}, found {len(rows)}"
+        )
+    return rows.iloc[0]
+
+
+def _cross_matrix_conclusions(comparison: pd.DataFrame) -> list[str]:
+    timed = _timed_rows(comparison)
+    zero_trade = timed.loc[timed["is_zero_trade"]]
+    exposed = timed.loc[~timed["is_zero_trade"]]
+    improved = exposed["return_delta_vs_baseline"].astype(float) > SUMMARY_TOLERANCE
+    pool_all_improved = exposed.groupby("pool")["return_delta_vs_baseline"].apply(
+        lambda values: bool((values.astype(float) > SUMMARY_TOLERANCE).all())
+    )
+
+    pair_signs: list[str] = []
+    for (_, _), rows in exposed.groupby(["pool", "timing_variant"]):
+        if set(rows["position_config"]) != set(POSITIONS) or len(rows) != len(POSITIONS):
+            continue
+        values = rows["return_delta_vs_baseline"].astype(float)
+        if (values > SUMMARY_TOLERANCE).all():
+            pair_signs.append("positive")
+        elif (values < -SUMMARY_TOLERANCE).all():
+            pair_signs.append("negative")
+        elif (values.abs() <= SUMMARY_TOLERANCE).all():
+            pair_signs.append("flat")
+        else:
+            pair_signs.append("mixed")
+    consistent_count = sum(sign != "mixed" for sign in pair_signs)
+    positive_count = pair_signs.count("positive")
+    negative_count = pair_signs.count("negative")
+    flat_count = pair_signs.count("flat")
+    mixed_count = pair_signs.count("mixed")
+
+    drawdown_counts = {
+        label: int((exposed[column].astype(float) > SUMMARY_TOLERANCE).sum())
+        for label, column in (
+            ("5-minute", "max_drawdown_5m_delta_vs_baseline"),
+            ("conservative-low", "max_drawdown_low_delta_vs_baseline"),
+            ("daily", "max_drawdown_daily_delta_vs_baseline"),
+        )
+    }
+    return [
+        (
+            f"Among {len(exposed)} exposed timed rows, {int(improved.sum())} improve "
+            "return versus their position-matched baseline; "
+            f"{int(pool_all_improved.sum())} of {len(pool_all_improved)} exposed pools "
+            "improve in every timed row."
+        ),
+        (
+            f"{len(zero_trade)} zero-trade rows are reported separately and are not "
+            "counted as return improvements."
+        ),
+        (
+            "Return direction across position sizes is consistent in "
+            f"{consistent_count} of {len(pair_signs)} exposed pool/timing pairs: "
+            f"{positive_count} positive, {negative_count} negative, and {flat_count} "
+            f"flat; {mixed_count} pairs are mixed."
+        ),
+        (
+            f"Drawdown improvement among {len(exposed)} exposed timed rows: "
+            f"{drawdown_counts['5-minute']} improve 5-minute drawdown, "
+            f"{drawdown_counts['conservative-low']} improve conservative-low drawdown, "
+            f"and {drawdown_counts['daily']} improve daily drawdown."
+        ),
+    ]
+
+
+def _battery_conclusions(comparison: pd.DataFrame) -> list[str]:
+    timed = _timed_rows(comparison, "battery")
+    improved_return = int(
+        (timed["return_delta_vs_baseline"].astype(float) > SUMMARY_TOLERANCE).sum()
+    )
+    if improved_return == len(timed):
+        return_conclusion = (
+            f"All {len(timed)} battery timed rows improve return versus baseline."
+        )
+    elif improved_return == 0:
+        return_conclusion = "No battery timed row improves return versus baseline."
+    else:
+        return_conclusion = (
+            f"Battery return evidence is mixed: {improved_return} of {len(timed)} timed "
+            "rows improve return versus baseline."
+        )
+
+    lower_exposure_and_trades: list[bool] = []
+    for row in timed.itertuples(index=False):
+        baseline = _baseline_row(comparison, row.pool, row.position_config)
+        baseline_trades = int(baseline["closed_trade_count"]) + int(
+            baseline["open_trade_count"]
+        )
+        lower_exposure_and_trades.append(
+            float(row.capital_utilization) < float(baseline["capital_utilization"])
+            and int(row.total_trade_count) < baseline_trades
+        )
+    lower_count = sum(lower_exposure_and_trades)
+    if lower_count == len(timed):
+        exposure_conclusion = (
+            f"All {len(timed)} battery timed rows have lower capital utilization and "
+            "fewer total trades than their position-matched baselines; reduced exposure "
+            "is therefore material in this sample."
+        )
+    elif lower_count == 0:
+        exposure_conclusion = (
+            "No battery timed row has both lower capital utilization and fewer total "
+            "trades than baseline; the exposure/trade evidence is opposite or unchanged."
+        )
+    else:
+        exposure_conclusion = (
+            f"Battery exposure/trade evidence is mixed: {lower_count} of {len(timed)} "
+            "timed rows have both lower capital utilization and fewer total trades than "
+            "baseline."
+        )
+    all_drawdowns_improved = int(
+        (
+            (timed["max_drawdown_5m_delta_vs_baseline"] > SUMMARY_TOLERANCE)
+            & (timed["max_drawdown_low_delta_vs_baseline"] > SUMMARY_TOLERANCE)
+            & (timed["max_drawdown_daily_delta_vs_baseline"] > SUMMARY_TOLERANCE)
+        ).sum()
+    )
+    return [
+        return_conclusion,
+        (
+            f"{all_drawdowns_improved} of {len(timed)} battery timed rows improve all "
+            "three drawdown measures versus baseline."
+        ),
+        exposure_conclusion,
+    ]
+
+
+def _robot_conclusions(comparison: pd.DataFrame) -> list[str]:
+    timed = _timed_rows(comparison, "humanoid_robot_proxy")
+    deltas = timed["return_delta_vs_baseline"].astype(float)
+    missed_count = int((deltas < -SUMMARY_TOLERANCE).sum())
+    outperformed_count = int((deltas > SUMMARY_TOLERANCE).sum())
+    five_minute_improved = int(
+        (timed["max_drawdown_5m_delta_vs_baseline"] > SUMMARY_TOLERANCE).sum()
+    )
+    if missed_count == len(timed):
+        return_conclusion = (
+            f"All {len(timed)} robot timed rows return less than their "
+            "position-matched baselines."
+        )
+        if five_minute_improved == len(timed):
+            tradeoff_conclusion = (
+                f"In this sample, all {len(timed)} robot timed rows pair missed upside "
+                "with improved five-minute drawdown. Whether drawdown control compensates "
+                "for missed upside is a sample-specific trade-off, not a universal conclusion."
+            )
+        else:
+            tradeoff_conclusion = (
+                f"Only {five_minute_improved} of {len(timed)} robot timed rows improve "
+                "five-minute drawdown, so the sample does not show consistent drawdown "
+                "control alongside missed upside."
+            )
+    elif outperformed_count == len(timed):
+        return_conclusion = (
+            f"All {len(timed)} robot timed rows outperformed their position-matched "
+            "baselines; there is no missed-upside result in these rows."
+        )
+        tradeoff_conclusion = (
+            f"{five_minute_improved} of {len(timed)} robot timed rows improve "
+            "five-minute drawdown; no missed-upside compensation claim applies."
+        )
+    else:
+        flat_count = len(timed) - missed_count - outperformed_count
+        return_conclusion = (
+            "Robot return evidence is mixed: "
+            f"{missed_count} timed rows trail baseline, {outperformed_count} outperform, "
+            f"and {flat_count} are flat."
+        )
+        tradeoff_conclusion = (
+            f"{five_minute_improved} of {len(timed)} robot timed rows improve "
+            "five-minute drawdown; the mixed sample does not support a universal "
+            "missed-upside-versus-drawdown conclusion."
+        )
+    return [return_conclusion, tradeoff_conclusion]
+
+
+def _terminal_event_conclusion(timeline: pd.DataFrame) -> str:
+    signal_dates = pd.to_datetime(timeline["signal_date"], errors="coerce").dt.strftime(
+        "%Y-%m-%d"
+    )
+    effective = pd.to_datetime(
+        timeline["effective_timestamp"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M:%S")
+    terminal = timeline.loc[
+        timeline["execution_mode"].eq("next_session_0935")
+        & signal_dates.eq("2026-07-17")
+        & effective.eq("2026-07-20 09:35:00")
+    ]
+    expected_definitions = {"single_day_4pct", "two_day_total_4pct"}
+    found_definitions = set(terminal["timing_definition"].astype(str))
+    complete = len(terminal) == 2 and found_definitions == expected_definitions
+    if complete:
+        return (
+            "The audit contains both expected July 20 terminal next-session effective "
+            "rows (2 of 2), one for each supplied definition."
+        )
+    return (
+        "Terminal-event audit warning: expected 2 July 20 terminal next-session "
+        f"effective rows, found {len(terminal)}; retention is missing or incomplete."
     )
 
 
@@ -669,12 +906,11 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
         group = ai.loc[ai["position_config"] == position].set_index("timing_variant")
         same = group.loc["same_day_1455"]
         next_row = group.loc["next_session_0935"]
-        advantage = float(same["total_net_return"] - next_row["total_net_return"])
-        direction = "advantage" if advantage >= 0 else "disadvantage"
+        timing_delta = float(same["same_day_minus_next_session_return"])
         lines.append(
             f"- {position}: same-day {_percent(same['total_net_return'])} versus "
-            f"next-session {_percent(next_row['total_net_return'])}, a "
-            f"{_percent(abs(advantage))} same-day {direction}; closed-trade denominators "
+            f"next-session {_percent(next_row['total_net_return'])}, "
+            f"{_same_day_difference(timing_delta)}; closed-trade denominators "
             f"{int(same['closed_trade_count'])} and {int(next_row['closed_trade_count'])}."
         )
     lines.extend(
@@ -685,28 +921,20 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
                 "next-session control is the more conservative timing interpretation."
             ),
             "",
-            "## Battery: loss and drawdown reduction",
+            "## Cross-matrix consistency",
             "",
         ]
     )
+    lines.extend(_cross_matrix_conclusions(comparison))
+    lines.extend(["", "## Battery: computed return, drawdown, and exposure", ""])
     battery = comparison.loc[comparison["pool"] == "battery"]
     for position in POSITIONS:
         group = battery.loc[battery["position_config"] == position].set_index("timing_variant")
         lines.append(_metric_line(f"{position} baseline", group.loc["baseline"]))
         lines.append(_metric_line(f"{position} same-day", group.loc["same_day_1455"]))
         lines.append(_metric_line(f"{position} next-session", group.loc["next_session_0935"]))
-    lines.extend(
-        [
-            (
-                "These computed rows separate reduced loss/drawdown from stock-selection "
-                "quality: lower utilization and fewer trades show that reduced market "
-                "exposure is a material part of the timed outcome."
-            ),
-            "",
-            "## Humanoid robot proxy: missed upside versus drawdown control",
-            "",
-        ]
-    )
+    lines.extend(_battery_conclusions(comparison))
+    lines.extend(["", "## Humanoid robot proxy: computed return versus drawdown", ""])
     robot = comparison.loc[comparison["pool"] == "humanoid_robot_proxy"]
     for position in POSITIONS:
         group = robot.loc[robot["position_config"] == position].set_index("timing_variant")
@@ -721,17 +949,8 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
             f"{_percent(same['max_drawdown_5m'])} / "
             f"{_percent(next_row['max_drawdown_5m'])}."
         )
-    lines.extend(
-        [
-            (
-                "The timed overlay therefore needs to be judged as a trade-off: it missed "
-                "baseline upside while controlling drawdown and exposure."
-            ),
-            "",
-            "## Innovative drug: zero timed exposure",
-            "",
-        ]
-    )
+    lines.extend(_robot_conclusions(comparison))
+    lines.extend(["", "## Innovative drug: zero timed exposure", ""])
     drug_timed = comparison.loc[
         (comparison["pool"] == "innovative_drug")
         & (comparison["timing_variant"] != "baseline")
@@ -741,8 +960,9 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
         and (drug_timed["open_trade_count"] == 0).all()
     ):
         lines.append(
-            "All four innovative-drug timed rows have zero closed and open trades. Their "
-            "0% return and 0% drawdown mean no exposure, not an improvement in selection."
+            f"All {len(drug_timed)} innovative-drug timed rows have zero closed and open "
+            "trades. Their 0% return and 0% drawdown mean no exposure, not an improvement "
+            "in selection."
         )
     else:
         lines.append(
@@ -771,6 +991,7 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
             f"{int(row.closed_trade_count)} closed, {int(row.open_trade_count)} open."
         )
     equal_modes = timeline.groupby("execution_mode")["state_windows_equal"].all()
+    definition_count = int(timeline["timing_definition"].nunique())
     lines.extend(
         [
             "",
@@ -782,9 +1003,10 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
                     f"{mode}={str(bool(equal_modes.get(mode, False))).lower()}"
                     for mode in TIMINGS
                 )
-                + ". Distinct event audit rows remain in regime_timeline_comparison.csv, "
-                "including the July 20 terminal next-session effective event."
+                + f". The audit retains {len(timeline)} event rows across "
+                f"{definition_count} definitions."
             ),
+            _terminal_event_conclusion(timeline),
             (
                 "The regime dates were manually supplied and the exercise is post-hoc. "
                 "The 4% rise and -3% fall thresholds were not optimized here; no threshold "

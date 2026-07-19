@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -74,7 +75,7 @@ def _write_run(
     nav_values.iloc[-1] = initial_cash * (1.0 + total_return)
     nav_low = nav_values.copy()
     nav_low.iloc[4] -= 2.0 if closed_count else 0.0
-    capital_utilization = 0.0 if closed_count == 0 else 0.25
+    capital_utilization = 0.0 if closed_count == 0 else 0.10 if timed else 0.25
     gross_exposure = pd.Series(
         [initial_cash * capital_utilization] * len(CALENDAR), dtype=float
     )
@@ -283,7 +284,7 @@ class SyntheticMatrix:
                     self.repo_root / baseline,
                     total_return=baseline_return - offset,
                     drawdown=baseline_dd + offset,
-                    closed_count=8,
+                    closed_count=1 if pool == "innovative_drug" else 8,
                     timed=False,
                 )
                 for timing, timing_return in zip(TIMINGS, (same_return, next_return)):
@@ -436,6 +437,49 @@ class CompactSummaryIntegrationTests(unittest.TestCase):
                 self.assertIn(phrase, report)
             self.assertIn("8.00%", report)
             self.assertIn("6.00%", report)
+            self.assertIn(
+                "a same-day advantage of 2.00 percentage points",
+                report,
+            )
+            self.assertNotIn("2.00% same-day advantage", report)
+            self.assertIn(
+                "Among 12 exposed timed rows, 8 improve return versus their "
+                "position-matched baseline; 2 of 3 exposed pools improve in every timed row.",
+                report,
+            )
+            self.assertIn(
+                "4 zero-trade rows are reported separately and are not counted as "
+                "return improvements.",
+                report,
+            )
+            self.assertIn(
+                "Return direction across position sizes is consistent in 6 of 6 exposed "
+                "pool/timing pairs: 4 positive, 2 negative, and 0 flat; 0 pairs are mixed.",
+                report,
+            )
+            self.assertIn(
+                "Drawdown improvement among 12 exposed timed rows: 12 improve 5-minute "
+                "drawdown, 12 improve conservative-low drawdown, and 12 improve daily "
+                "drawdown.",
+                report,
+            )
+            self.assertIn(
+                "All 4 battery timed rows have lower capital utilization and fewer total "
+                "trades than their position-matched baselines; reduced exposure is "
+                "therefore material in this sample.",
+                report,
+            )
+            self.assertIn(
+                "In this sample, all 4 robot timed rows pair missed upside with improved "
+                "five-minute drawdown. Whether drawdown control compensates for missed "
+                "upside is a sample-specific trade-off, not a universal conclusion.",
+                report,
+            )
+            self.assertIn(
+                "The audit contains both expected July 20 terminal next-session effective "
+                "rows (2 of 2), one for each supplied definition.",
+                report,
+            )
 
             provenance_path = fixture.output_root / "run_sources.json"
             provenance_text = provenance_path.read_text(encoding="utf-8")
@@ -445,19 +489,227 @@ class CompactSummaryIntegrationTests(unittest.TestCase):
                 provenance["full_matrix_source_manifest"]["path"],
                 "outputs/matrix/run_sources.json",
             )
-            for name in (
+            self.assertEqual(
+                provenance["full_matrix_source_manifest"]["sha256"],
+                _sha256(fixture.manifest_path),
+            )
+            generated_names = {
                 "timing_comparison.csv",
                 "regime_timeline_comparison.csv",
                 "report.md",
-            ):
+            }
+            self.assertEqual(set(provenance["generated_sha256"]), generated_names)
+            for name in generated_names:
                 self.assertEqual(
                     provenance["generated_sha256"][name],
                     _sha256(fixture.output_root / name),
                 )
-            expected_consumed = (
-                "outputs/baselines/ai_semiconductor__canonical/nav_5m.csv"
+            expected_sources = set(fixture.manifest["source_sha256"])
+            for baseline in {run["baseline"] for run in fixture.runs}:
+                expected_sources.update(
+                    f"{baseline}/{name}" for name in summary.METRIC_ARTIFACTS
+                )
+            for run in fixture.runs:
+                run_root = f"outputs/matrix/{run['run_key']}"
+                expected_sources.update(
+                    f"{run_root}/{name}"
+                    for name in (*summary.METRIC_ARTIFACTS, "market_regime.csv")
+                )
+            self.assertEqual(set(provenance["source_sha256"]), expected_sources)
+            for relative, digest in provenance["source_sha256"].items():
+                self.assertEqual(digest, _sha256(fixture.repo_root / relative))
+
+            roundtrip = pd.read_csv(fixture.output_root / "timing_comparison.csv")
+            infinite_pf = roundtrip.loc[
+                (roundtrip["pool"] == "innovative_drug")
+                & (roundtrip["position_config"] == "canonical")
+                & (roundtrip["timing_variant"] == "baseline"),
+                "profit_factor",
+            ].iloc[0]
+            self.assertTrue(math.isinf(infinite_pf))
+            blank_metrics = roundtrip.loc[
+                (roundtrip["pool"] == "innovative_drug")
+                & (roundtrip["timing_variant"] != "baseline"),
+                ["win_rate", "profit_factor"],
+            ]
+            self.assertTrue(blank_metrics.isna().all().all())
+            with (fixture.output_root / "timing_comparison.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                serialized = list(csv.DictReader(handle))
+            serialized_infinite = next(
+                row
+                for row in serialized
+                if row["comparison_key"]
+                == "innovative_drug__canonical__baseline"
             )
-            self.assertIn(expected_consumed, provenance["source_sha256"])
+            self.assertEqual(serialized_infinite["profit_factor"], "inf")
+            serialized_blanks = [
+                row
+                for row in serialized
+                if row["pool"] == "innovative_drug"
+                and row["timing_variant"] != "baseline"
+            ]
+            self.assertTrue(
+                all(
+                    row["win_rate"] == "" and row["profit_factor"] == ""
+                    for row in serialized_blanks
+                )
+            )
+
+    def test_all_drawdown_deltas_have_explicit_consistent_signs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+            comparison, _ = summary.summarize(
+                repo_root=fixture.repo_root,
+                matrix_root=fixture.matrix_root,
+                output_root=fixture.output_root,
+            )
+
+            for (_, _), group in comparison.groupby(["pool", "position_config"]):
+                indexed = group.set_index("timing_variant")
+                baseline = indexed.loc["baseline"]
+                same = indexed.loc["same_day_1455"]
+                next_row = indexed.loc["next_session_0935"]
+                for metric in (
+                    "max_drawdown_5m",
+                    "max_drawdown_low",
+                    "max_drawdown_daily",
+                ):
+                    delta_column = f"{metric}_delta_vs_baseline"
+                    timing_column = f"same_day_minus_next_session_{metric}"
+                    for variant, row in indexed.iterrows():
+                        self.assertAlmostEqual(
+                            row[delta_column], row[metric] - baseline[metric]
+                        )
+                        self.assertAlmostEqual(
+                            row[timing_column], same[metric] - next_row[metric]
+                        )
+                        if variant != "baseline" and row["closed_trade_count"] > 0:
+                            self.assertGreater(row[delta_column], 0.0)
+
+    def test_same_day_claim_uses_percentage_point_delta_column(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+            comparison, timeline = summary.summarize(
+                repo_root=fixture.repo_root,
+                matrix_root=fixture.matrix_root,
+                output_root=fixture.output_root,
+            )
+            mask = (
+                (comparison["pool"] == "ai_semiconductor")
+                & (comparison["position_config"] == "canonical")
+            )
+            comparison.loc[mask, "same_day_minus_next_session_return"] = -0.01
+
+            report = summary.render_report(comparison, timeline)
+
+            self.assertIn(
+                "- canonical: same-day 8.00% versus next-session 6.00%, a same-day "
+                "disadvantage of 1.00 percentage points",
+                report,
+            )
+            self.assertNotIn(
+                "- canonical: same-day 8.00% versus next-session 6.00%, a same-day "
+                "advantage of 2.00 percentage points",
+                report,
+            )
+
+    def test_battery_language_changes_when_computed_metrics_reverse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+            comparison, timeline = summary.summarize(
+                repo_root=fixture.repo_root,
+                matrix_root=fixture.matrix_root,
+                output_root=fixture.output_root,
+            )
+            for position in POSITIONS:
+                baseline_mask = (
+                    (comparison["pool"] == "battery")
+                    & (comparison["position_config"] == position)
+                    & (comparison["timing_variant"] == "baseline")
+                )
+                timed_mask = (
+                    (comparison["pool"] == "battery")
+                    & (comparison["position_config"] == position)
+                    & (comparison["timing_variant"] != "baseline")
+                )
+                baseline = comparison.loc[baseline_mask].iloc[0]
+                comparison.loc[timed_mask, "total_net_return"] = (
+                    float(baseline["total_net_return"]) - 0.05
+                )
+                comparison.loc[timed_mask, "return_delta_vs_baseline"] = -0.05
+                comparison.loc[timed_mask, "capital_utilization"] = (
+                    float(baseline["capital_utilization"]) + 0.10
+                )
+                comparison.loc[timed_mask, "closed_trade_count"] = (
+                    int(baseline["closed_trade_count"]) + 1
+                )
+
+            report = summary.render_report(comparison, timeline)
+
+            self.assertIn("No battery timed row improves return versus baseline.", report)
+            self.assertIn(
+                "No battery timed row has both lower capital utilization and fewer total "
+                "trades than baseline; the exposure/trade evidence is opposite or unchanged.",
+                report,
+            )
+            self.assertNotIn("reduced exposure is therefore material", report)
+
+    def test_robot_language_changes_when_timed_returns_outperform(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+            comparison, timeline = summary.summarize(
+                repo_root=fixture.repo_root,
+                matrix_root=fixture.matrix_root,
+                output_root=fixture.output_root,
+            )
+            for position in POSITIONS:
+                baseline_mask = (
+                    (comparison["pool"] == "humanoid_robot_proxy")
+                    & (comparison["position_config"] == position)
+                    & (comparison["timing_variant"] == "baseline")
+                )
+                timed_mask = (
+                    (comparison["pool"] == "humanoid_robot_proxy")
+                    & (comparison["position_config"] == position)
+                    & (comparison["timing_variant"] != "baseline")
+                )
+                baseline_return = float(
+                    comparison.loc[baseline_mask, "total_net_return"].iloc[0]
+                )
+                comparison.loc[timed_mask, "total_net_return"] = baseline_return + 0.05
+                comparison.loc[timed_mask, "return_delta_vs_baseline"] = 0.05
+
+            report = summary.render_report(comparison, timeline)
+
+            self.assertIn(
+                "All 4 robot timed rows outperformed their position-matched baselines; "
+                "there is no missed-upside result in these rows.",
+                report,
+            )
+            self.assertNotIn("pair missed upside", report)
+
+    def test_terminal_event_language_warns_when_july20_rows_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+            comparison, timeline = summary.summarize(
+                repo_root=fixture.repo_root,
+                matrix_root=fixture.matrix_root,
+                output_root=fixture.output_root,
+            )
+            timeline = timeline.loc[
+                timeline["effective_timestamp"] != "2026-07-20 09:35:00"
+            ].copy()
+
+            report = summary.render_report(comparison, timeline)
+
+            self.assertIn(
+                "Terminal-event audit warning: expected 2 July 20 terminal next-session "
+                "effective rows, found 0; retention is missing or incomplete.",
+                report,
+            )
+            self.assertNotIn("contains both expected July 20 terminal", report)
 
     def test_duplicate_and_missing_matrix_runs_fail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
