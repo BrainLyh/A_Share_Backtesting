@@ -429,7 +429,47 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         ).encode("utf-8")
         regime_path.write_bytes(source_bytes)
 
-        with self.assertRaisesRegex(ValueError, "must not alias output market_regime.csv"):
+        with self.assertRaisesRegex(ValueError, "must not alias .*market_regime.csv"):
+            main(
+                [
+                    "--minute-root",
+                    str(self.minute_root),
+                    "--qfq-source",
+                    str(self.qfq_path),
+                    "--stock-pool",
+                    str(self.pool_path),
+                    "--config",
+                    str(self.config_path),
+                    "--market-regime",
+                    str(regime_path),
+                    "--output",
+                    str(self.output),
+                    "--analysis-start",
+                    "2026-07-17",
+                    "--analysis-end",
+                    "2026-07-17",
+                ]
+            )
+
+        self.assertEqual(regime_path.read_bytes(), source_bytes)
+
+    def test_market_regime_source_cannot_alias_another_generated_output(self) -> None:
+        self.write_inputs()
+        self.output.mkdir(parents=True)
+        regime_path = self.output / "fills.csv"
+        source_bytes = json.dumps(
+            {
+                "observation_start": "2026-07-17",
+                "initial_state": "risk_on",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": "2026-07-17", "event": "down", "label": "risk_off"}
+                ],
+            }
+        ).encode("utf-8")
+        regime_path.write_bytes(source_bytes)
+
+        with self.assertRaisesRegex(ValueError, "must not alias .*fills.csv"):
             main(
                 [
                     "--minute-root",
@@ -570,6 +610,55 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         self.assertIn("Market-regime dates were manually supplied.", report)
         self.assertIn("Market-regime thresholds are post-hoc.", report)
         self.assertIn("`same_day_1455` assumes the full signal is observable by 14:55.", report)
+
+    def test_market_regime_uses_qfq_session_when_whole_minute_session_is_absent(self) -> None:
+        self.write_inputs(("2026-07-16", "2026-07-20"))
+        regime_path = self.root / "market_regime.json"
+        regime_path.write_text(
+            json.dumps(
+                {
+                    "observation_start": "2026-07-16",
+                    "initial_state": "risk_on",
+                    "execution_mode": "next_session_0935",
+                    "events": [
+                        {
+                            "signal_date": "2026-07-16",
+                            "event": "down",
+                            "label": "missing_session_exit",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code = main(
+            [
+                "--minute-root",
+                str(self.minute_root),
+                "--qfq-source",
+                str(self.qfq_path),
+                "--stock-pool",
+                str(self.pool_path),
+                "--config",
+                str(self.config_path),
+                "--market-regime",
+                str(regime_path),
+                "--output",
+                str(self.output),
+                "--analysis-start",
+                "2026-07-16",
+                "--analysis-end",
+                "2026-07-20",
+            ]
+        )
+
+        self.assertEqual(exit_code, 0)
+        timeline = pd.read_csv(self.output / "market_regime.csv")
+        self.assertEqual(
+            pd.Timestamp(timeline.loc[0, "effective_timestamp"]),
+            pd.Timestamp("2026-07-17 09:35:00"),
+        )
 
     def test_market_regime_calendar_extensions_are_explicitly_validated(self) -> None:
         minutes = {"600001": pd.DataFrame({"date": [pd.Timestamp("2026-07-17")]})}

@@ -7,12 +7,17 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 
 from a_share_backtesting.market_regime import (
     MarketRegimeSchedule,
     build_market_regime_schedule,
     load_market_regime_config,
+)
+from a_share_backtesting.trade_reconciliation import (
+    reconcile_trade_economics,
+    reconciled_trade_metrics,
 )
 
 
@@ -56,6 +61,15 @@ FILL_COLUMNS = [
     "slippage_cost",
     "cash_delta",
 ]
+POSITION_COLUMNS = [
+    "timestamp",
+    "position_id",
+    "code",
+    "remaining_shares",
+    "market_value",
+    "position_return",
+    "position_return_low",
+]
 REGIME_COLUMNS = [
     "signal_date",
     "effective_timestamp",
@@ -69,6 +83,7 @@ METRIC_ARTIFACTS = (
     "nav_5m.csv",
     "nav_daily.csv",
     "fills.csv",
+    "positions.csv",
     "trades.csv",
     "portfolio_summary.csv",
     "trade_summary.csv",
@@ -106,7 +121,7 @@ def _numeric(frame: pd.DataFrame, columns: Sequence[str], path: Path) -> pd.Data
     result = frame.copy()
     for column in columns:
         result[column] = pd.to_numeric(result[column], errors="coerce")
-        if result[column].isna().any():
+        if result[column].isna().any() or not np.isfinite(result[column]).all():
             raise ValueError(f"{path} contains non-numeric {column}")
     return result
 
@@ -143,7 +158,18 @@ def _assert_metric(
         source_value = float(reported)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{artifact} has invalid {field}: {reported!r}") from error
-    if not _same_number(float(recomputed), source_value):
+    recomputed_value = float(recomputed)
+    if math.isinf(source_value):
+        if (
+            field == "profit_factor"
+            and source_value > 0.0
+            and recomputed_value == source_value
+        ):
+            return
+        raise ValueError(f"{artifact} has invalid non-finite {field}")
+    if math.isinf(recomputed_value) or not _same_number(
+        recomputed_value, source_value
+    ):
         raise ValueError(
             f"{artifact} {field} mismatch: recomputed={recomputed!r}, "
             f"reported={source_value!r}, tolerance={SUMMARY_TOLERANCE}"
@@ -156,6 +182,7 @@ def recompute_run_metrics(run_dir: str | Path) -> dict[str, float | int]:
     daily_path = directory / "nav_daily.csv"
     fills_path = directory / "fills.csv"
     trades_path = directory / "trades.csv"
+    positions_path = directory / "positions.csv"
     portfolio_path = directory / "portfolio_summary.csv"
     trade_summary_path = directory / "trade_summary.csv"
 
@@ -174,6 +201,7 @@ def recompute_run_metrics(run_dir: str | Path) -> dict[str, float | int]:
         raise ValueError(f"NAV artifacts must not be empty: {directory}")
     fills = _read_csv(fills_path, FILL_COLUMNS)
     trades = _read_csv(trades_path, TRADE_COLUMNS)
+    positions = _read_csv(positions_path, POSITION_COLUMNS)
     if not fills.empty:
         fills = _numeric(fills, ["gross_notional"], fills_path)
     if not trades.empty:
@@ -213,19 +241,15 @@ def recompute_run_metrics(run_dir: str | Path) -> dict[str, float | int]:
             f"{first_nav!r} != {initial_cash!r}"
         )
 
-    closed = trades.loc[trades["status"].eq("closed")].copy()
-    opened = trades.loc[trades["status"].eq("open")].copy()
-    unknown_statuses = set(trades["status"].dropna().astype(str)) - {"closed", "open"}
-    if unknown_statuses:
-        raise ValueError(f"{trades_path} contains unknown statuses: {unknown_statuses}")
-    wins = closed.loc[closed["net_pnl"] > 0, "net_pnl"]
-    losses = closed.loc[closed["net_pnl"] < 0, "net_pnl"]
-    if not losses.empty:
-        profit_factor = float(wins.sum() / abs(losses.sum()))
-    elif not wins.empty:
-        profit_factor = float("inf")
-    else:
-        profit_factor = float("nan")
+    reconciled = reconcile_trade_economics(
+        fills,
+        trades,
+        positions,
+        pd.to_datetime(nav["timestamp"], errors="raise").max(),
+    )
+    trade_metrics = reconciled_trade_metrics(reconciled)
+    closed = reconciled.loc[reconciled["status"].eq("closed")].copy()
+    opened = reconciled.loc[reconciled["status"].eq("open")].copy()
 
     close_nav = nav["nav"].astype(float)
     close_peaks = close_nav.cummax()
@@ -237,12 +261,8 @@ def recompute_run_metrics(run_dir: str | Path) -> dict[str, float | int]:
         "closed_trade_count": int(len(closed)),
         "open_trade_count": int(len(opened)),
         "win_rate_denominator": int(len(closed)),
-        "win_rate": (
-            float((closed["net_pnl"] > 0).mean())
-            if not closed.empty
-            else float("nan")
-        ),
-        "profit_factor": profit_factor,
+        "win_rate": float(trade_metrics["win_rate"]),
+        "profit_factor": float(trade_metrics["profit_factor"]),
         "capital_utilization": float(nav["gross_exposure"].mean() / initial_cash),
         "turnover": float(fills["gross_notional"].sum() / initial_cash),
         "regime_exit_count": int(
@@ -604,7 +624,7 @@ def build_timing_comparison(
                         else int(risk_on_counts[variant])
                     ),
                     "zero_trade_count_flag": closed_count == 0,
-                    "low_trade_count_flag": 2 <= closed_count <= 6,
+                    "low_trade_count_flag": 1 <= closed_count <= 6,
                 }
                 for metric in DELTA_METRICS:
                     delta_name = (
@@ -979,7 +999,7 @@ def render_report(comparison: pd.DataFrame, timeline: pd.DataFrame) -> str:
             "## Sample size",
             "",
             (
-                f"{len(low)} timed rows have only 2-6 closed trades. Win rates and profit "
+                f"{len(low)} timed rows have only 1-6 closed trades. Win rates and profit "
                 "factors are reported with their closed-trade denominators and are too "
                 "thin for stable inference."
             ),

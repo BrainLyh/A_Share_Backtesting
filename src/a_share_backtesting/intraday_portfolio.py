@@ -204,6 +204,8 @@ def run_intraday_portfolio(
     nav_rows: list[dict[str, object]] = []
 
     date_index = {date: index for index, date in enumerate(all_dates)}
+    regime_transitions = market_regime.transitions if market_regime is not None else ()
+    next_regime_transition = 0
     for date in all_dates:
         exited_today: set[str] = set()
         minute_days = {
@@ -215,15 +217,25 @@ def run_intraday_portfolio(
         day_candidates: pd.DataFrame | None = None
         for timestamp in timestamps:
             newly_entered: set[str] = set()
-            regime_transition = market_regime.event_at(timestamp) if market_regime is not None else None
-            if regime_transition is not None and regime_transition.event == "down":
+            crossed_transitions = []
+            while (
+                next_regime_transition < len(regime_transitions)
+                and regime_transitions[next_regime_transition].effective_timestamp <= timestamp
+            ):
+                crossed_transitions.append(regime_transitions[next_regime_transition])
+                next_regime_transition += 1
+            for regime_transition in crossed_transitions:
+                if regime_transition.event != "down":
+                    continue
                 trigger_column = "close" if regime_transition.execution_mode == "same_day_1455" else "open"
                 for code, position in open_positions.items():
                     position_pending = pending.get(position.position_id, [])
                     if any(order.reason == "market_regime_exit" for order in position_pending):
                         continue
-                    raw_bar = _bar_at(minute_days[code], timestamp) if code in minute_days else None
-                    # A deferred Task 2 order ignores this sentinel and prices from its next bar's open.
+                    raw_bar = None
+                    if regime_transition.effective_timestamp == timestamp and code in minute_days:
+                        raw_bar = _bar_at(minute_days[code], timestamp)
+                    # A deferred order keeps the event timestamp and prices from its next bar's open.
                     trigger_price = float("nan")
                     if raw_bar is not None:
                         current_scale = float(raw_bar.get("qfq_scale", 1.0))
@@ -238,7 +250,7 @@ def run_intraday_portfolio(
                             "market_regime_exit",
                             position.remaining_shares,
                             trigger_price,
-                            timestamp,
+                            regime_transition.effective_timestamp,
                         )
                     ]
             for code in sorted(list(open_positions)):

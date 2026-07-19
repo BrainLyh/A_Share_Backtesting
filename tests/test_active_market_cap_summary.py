@@ -119,26 +119,66 @@ def _write_run(
     trades.to_csv(run_dir / "trades.csv", index=False)
 
     fill_rows = []
-    if closed_count:
-        fill_rows.append(
+    position_rows = []
+    for trade_row in trade_rows:
+        proceeds = float(trade_row["net_proceeds"])
+        common = {
+            "position_id": trade_row["position_id"],
+            "code": trade_row["code"],
+            "shares": 1,
+            "commission": 0.0,
+            "stamp_duty": 0.0,
+            "slippage_cost": 0.0,
+        }
+        fill_rows.extend(
+            [
+                {
+                    **common,
+                    "timestamp": trade_row["entry_timestamp"],
+                    "side": "buy",
+                    "reason": "entry",
+                    "raw_price": 100.0,
+                    "adjusted_price": 100.0,
+                    "gross_notional": 100.0,
+                    "cash_delta": -100.0,
+                },
+                {
+                    **common,
+                    "timestamp": trade_row["exit_timestamp"],
+                    "side": "sell",
+                    "reason": trade_row["exit_reason"],
+                    "raw_price": proceeds,
+                    "adjusted_price": proceeds,
+                    "gross_notional": proceeds,
+                    "cash_delta": proceeds,
+                },
+            ]
+        )
+        position_rows.append(
             {
-                "position_id": "position-0",
-                "code": "000000",
-                "timestamp": "2026-06-15 14:55:00",
-                "side": "buy",
-                "reason": "entry",
-                "shares": 1,
-                "raw_price": 100.0,
-                "adjusted_price": 100.0,
-                "gross_notional": 100.0,
-                "commission": 0.0,
-                "stamp_duty": 0.0,
-                "slippage_cost": 0.0,
-                "cash_delta": -100.0,
+                "timestamp": trade_row["entry_timestamp"],
+                "position_id": trade_row["position_id"],
+                "code": trade_row["code"],
+                "remaining_shares": 1,
+                "market_value": 100.0,
+                "position_return": 0.0,
+                "position_return_low": -0.02,
             }
         )
     fills = pd.DataFrame(fill_rows, columns=summary.FILL_COLUMNS)
     fills.to_csv(run_dir / "fills.csv", index=False)
+    pd.DataFrame(
+        position_rows,
+        columns=[
+            "timestamp",
+            "position_id",
+            "code",
+            "remaining_shares",
+            "market_value",
+            "position_return",
+            "position_return_low",
+        ],
+    ).to_csv(run_dir / "positions.csv", index=False)
 
     closed = trades.loc[trades["status"].eq("closed")]
     wins = closed.loc[closed["net_pnl"] > 0, "net_pnl"]
@@ -179,6 +219,10 @@ def _write_run(
         ]
     )
     trade_summary.to_csv(run_dir / "trade_summary.csv", index=False)
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps({"synthetic_run": run_dir.name}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     if timed:
         assert regime_frame is not None
         regime_frame.to_csv(run_dir / "market_regime.csv", index=False)
@@ -208,6 +252,12 @@ class SyntheticMatrix:
             "runs": self.runs,
             "source_sha256": {
                 path: _sha256(root / path) for path in sorted(source_paths)
+            },
+            "timed_run_manifest_sha256": {
+                f"{run['run_key']}/run_manifest.json": _sha256(
+                    self.matrix_root / str(run["run_key"]) / "run_manifest.json"
+                )
+                for run in self.runs
             },
         }
         self.manifest_path = self.matrix_root / "run_sources.json"
@@ -296,6 +346,7 @@ class SyntheticMatrix:
                             "position_config": position,
                             "timing_mode": timing,
                             "run_key": run_key,
+                            "run_manifest": f"{run_key}/run_manifest.json",
                             "baseline": baseline,
                             "baseline_calendar": f"{baseline}/nav_daily.csv",
                             "config": self.portfolio_config,
@@ -346,7 +397,55 @@ class MetricRecomputationTests(unittest.TestCase):
             self.assertEqual(metrics["win_rate"], 1.0)
             self.assertTrue(math.isinf(metrics["profit_factor"]))
             self.assertAlmostEqual(metrics["capital_utilization"], 0.25)
-            self.assertAlmostEqual(metrics["turnover"], 1.0)
+            self.assertAlmostEqual(metrics["turnover"], 2.1)
+
+    def test_baseline_trade_corruption_is_rejected_from_fill_economics(self) -> None:
+        mutations = {
+            "entry_cost": 101.0,
+            "net_proceeds": 999.0,
+            "net_pnl": 999.0,
+            "net_return": 9.99,
+            "entry_timestamp": "2026-06-16 14:55:00",
+            "exit_timestamp": "2026-06-23 14:55:00",
+            "exit_reason": "stop_loss",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                run_dir = Path(temporary) / "baseline"
+                _write_run(
+                    run_dir,
+                    total_return=0.10,
+                    drawdown=-0.10,
+                    closed_count=1,
+                    timed=False,
+                )
+                trades = pd.read_csv(run_dir / "trades.csv")
+                trades.loc[0, field] = value
+                trades.to_csv(run_dir / "trades.csv", index=False)
+
+                with self.assertRaisesRegex(ValueError, field):
+                    summary.recompute_run_metrics(run_dir)
+
+    def test_recomputation_rejects_infinite_nav_economics(self) -> None:
+        for value in (float("inf"), float("-inf")):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                run_dir = Path(temporary) / "run"
+                _write_run(
+                    run_dir,
+                    total_return=0.10,
+                    drawdown=-0.10,
+                    closed_count=1,
+                    timed=False,
+                )
+                nav = pd.read_csv(run_dir / "nav_5m.csv")
+                nav.loc[:, "gross_exposure"] = value
+                nav.to_csv(run_dir / "nav_5m.csv", index=False)
+                portfolio = pd.read_csv(run_dir / "portfolio_summary.csv")
+                portfolio.loc[0, "capital_utilization"] = value
+                portfolio.to_csv(run_dir / "portfolio_summary.csv", index=False)
+
+                with self.assertRaisesRegex(ValueError, "gross_exposure"):
+                    summary.recompute_run_metrics(run_dir)
 
     def test_source_summary_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -367,6 +466,29 @@ class MetricRecomputationTests(unittest.TestCase):
 
 
 class CompactSummaryIntegrationTests(unittest.TestCase):
+    def test_low_trade_count_includes_one_but_excludes_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+
+            comparison, _ = summary.summarize(
+                repo_root=fixture.repo_root,
+                matrix_root=fixture.matrix_root,
+                output_root=fixture.output_root,
+            )
+
+            one_trade = comparison.loc[
+                comparison["closed_trade_count"].eq(1)
+            ]
+            zero_trade = comparison.loc[
+                comparison["closed_trade_count"].eq(0)
+            ]
+            self.assertFalse(one_trade.empty)
+            self.assertTrue(one_trade["low_trade_count_flag"].all())
+            self.assertTrue(zero_trade["zero_trade_count_flag"].all())
+            self.assertFalse(zero_trade["low_trade_count_flag"].any())
+            report = (fixture.output_root / "report.md").read_text(encoding="utf-8")
+            self.assertIn("only 1-6 closed trades", report)
+
     def test_writes_exact_matrix_deltas_timeline_report_and_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = SyntheticMatrix(Path(temporary))
@@ -726,6 +848,20 @@ class CompactSummaryIntegrationTests(unittest.TestCase):
             fixture.manifest["runs"] = fixture.manifest["runs"][:-2]
             fixture._save_manifest()
             with self.assertRaisesRegex(ValueError, "missing"):
+                summary.summarize(
+                    repo_root=fixture.repo_root,
+                    matrix_root=fixture.matrix_root,
+                    output_root=fixture.output_root,
+                )
+
+    def test_timed_run_manifest_hash_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SyntheticMatrix(Path(temporary))
+            run_key = str(fixture.runs[0]["run_key"])
+            manifest_path = fixture.matrix_root / run_key / "run_manifest.json"
+            manifest_path.write_text("mutated\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "timed run manifest hash mismatch"):
                 summary.summarize(
                     repo_root=fixture.repo_root,
                     matrix_root=fixture.matrix_root,

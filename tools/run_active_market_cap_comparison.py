@@ -21,6 +21,11 @@ from a_share_backtesting.market_regime import (
     build_market_regime_schedule,
     load_market_regime_config,
 )
+from a_share_backtesting.trade_reconciliation import (
+    TradeEconomicsError,
+    reconcile_trade_economics as _reconcile_trade_economics,
+    reconciled_trade_metrics,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -208,6 +213,39 @@ CSV_SCHEMAS: dict[str, list[str]] = {
         "resulting_state",
         "execution_mode",
     ],
+}
+_FINITE_ECONOMIC_COLUMNS: dict[str, list[str]] = {
+    "fills.csv": [
+        "shares",
+        "raw_price",
+        "adjusted_price",
+        "gross_notional",
+        "commission",
+        "stamp_duty",
+        "slippage_cost",
+        "cash_delta",
+    ],
+    "positions.csv": [
+        "remaining_shares",
+        "market_value",
+        "position_return",
+        "position_return_low",
+    ],
+    "trades.csv": [
+        "entry_cost",
+        "net_proceeds",
+        "net_pnl",
+        "net_return",
+        "holding_days",
+        "maximum_adverse_excursion",
+    ],
+    "nav_5m.csv": ["cash", "gross_exposure", "positions", "nav", "nav_low"],
+    "nav_daily.csv": ["cash", "gross_exposure", "positions", "nav", "nav_low"],
+    "portfolio_summary.csv": _PORTFOLIO_SUMMARY_COLUMNS,
+    "trade_summary.csv": [
+        column for column in CSV_SCHEMAS["trade_summary.csv"] if column != "profit_factor"
+    ],
+    "comparison.csv": _PORTFOLIO_SUMMARY_COLUMNS,
 }
 
 
@@ -437,6 +475,15 @@ def _numeric(frame: pd.DataFrame, columns: Sequence[str], artifact: str) -> pd.D
     return converted
 
 
+def _reject_infinite_economics(frames: Mapping[str, pd.DataFrame]) -> None:
+    for artifact, columns in _FINITE_ECONOMIC_COLUMNS.items():
+        frame = frames[artifact]
+        for column in columns:
+            values = pd.to_numeric(frame[column], errors="coerce")
+            if np.isinf(values).any():
+                raise ReconciliationError(f"{artifact} has infinite {column}")
+
+
 def _timestamps(
     frame: pd.DataFrame,
     columns: Sequence[str],
@@ -465,13 +512,52 @@ def _runner_file_source_sha256(path: Path) -> str:
 
 
 def _require_manifest_value(
-    manifest: Mapping[str, object], field: str, expected: object
+    manifest: Mapping[str, object],
+    field: str,
+    expected: object,
+    *,
+    artifact: str = "run_manifest.json",
 ) -> None:
     if manifest.get(field) != expected:
         raise ReconciliationError(
-            f"run_manifest.json manifest mismatch for {field}: "
+            f"{artifact} manifest mismatch for {field}: "
             f"{manifest.get(field)!r} != {expected!r}"
         )
+
+
+def _validate_manifest_target(
+    manifest: Mapping[str, object],
+    expected_target: float,
+    *,
+    artifact: str,
+) -> None:
+    execution_config = manifest.get("execution_config")
+    target = (
+        execution_config.get("target_fraction")
+        if isinstance(execution_config, Mapping)
+        else None
+    )
+    try:
+        matches_target = math.isclose(
+            float(target), expected_target, rel_tol=1e-12, abs_tol=1e-12
+        )
+    except (TypeError, ValueError):
+        matches_target = False
+    if not matches_target:
+        raise ReconciliationError(
+            f"{artifact} target fraction mismatch: "
+            f"{target!r} != {expected_target!r}"
+        )
+
+
+def _validate_clean_revision(
+    manifest: Mapping[str, object], *, artifact: str
+) -> None:
+    if manifest.get("git_dirty") is not False:
+        raise ReconciliationError(f"{artifact} git_dirty must be false")
+    revision = manifest.get("git_revision")
+    if not isinstance(revision, str) or not revision.strip():
+        raise ReconciliationError(f"{artifact} git_revision must be non-empty")
 
 
 def _validate_run_manifest(
@@ -495,16 +581,9 @@ def _validate_run_manifest(
         raise ReconciliationError(
             f"cannot parse frozen baseline run_manifest.json: {error}"
         ) from error
-    baseline_minute_hash = (
-        baseline_manifest.get("minute_source_sha256")
-        if isinstance(baseline_manifest, Mapping)
-        else None
-    )
-    if not isinstance(baseline_minute_hash, str) or not baseline_minute_hash:
-        raise ReconciliationError(
-            "frozen baseline run_manifest.json lacks minute_source_sha256"
-        )
-    expected = {
+    if not isinstance(baseline_manifest, Mapping):
+        raise ReconciliationError("frozen baseline run_manifest.json schema drift")
+    common_expected = {
         "mode": "intraday-b1-portfolio",
         "analysis_start": ANALYSIS_START,
         "analysis_end": ANALYSIS_END,
@@ -514,6 +593,31 @@ def _validate_run_manifest(
         "config_sha256": _sha256_file(config),
         "scan_source": str(scan.resolve()),
         "scan_source_sha256": _sha256_file(scan),
+    }
+    baseline_artifact = "frozen baseline run_manifest.json"
+    for field, value in common_expected.items():
+        _require_manifest_value(
+            baseline_manifest,
+            field,
+            value,
+            artifact=baseline_artifact,
+        )
+    expected_target = POSITION_CONFIGS[job.position].target_fraction
+    _validate_manifest_target(
+        baseline_manifest,
+        expected_target,
+        artifact=baseline_artifact,
+    )
+    _validate_clean_revision(baseline_manifest, artifact=baseline_artifact)
+    baseline_minute_hash = (
+        baseline_manifest.get("minute_source_sha256")
+    )
+    if not isinstance(baseline_minute_hash, str) or not baseline_minute_hash:
+        raise ReconciliationError(
+            "frozen baseline run_manifest.json lacks minute_source_sha256"
+        )
+    expected = {
+        **common_expected,
         "market_regime_source": str(regime.resolve()),
         "market_regime_source_sha256": _sha256_file(regime),
         "minute_source_sha256": baseline_minute_hash,
@@ -521,21 +625,12 @@ def _validate_run_manifest(
     }
     for field, value in expected.items():
         _require_manifest_value(manifest, field, value)
-
-    execution_config = manifest.get("execution_config")
-    target = execution_config.get("target_fraction") if isinstance(execution_config, Mapping) else None
-    expected_target = POSITION_CONFIGS[job.position].target_fraction
-    try:
-        matches_target = math.isclose(
-            float(target), expected_target, rel_tol=1e-12, abs_tol=1e-12
-        )
-    except (TypeError, ValueError):
-        matches_target = False
-    if not matches_target:
-        raise ReconciliationError(
-            "run_manifest.json target fraction mismatch: "
-            f"{target!r} != {expected_target!r}"
-        )
+    _validate_manifest_target(
+        manifest,
+        expected_target,
+        artifact="run_manifest.json",
+    )
+    _validate_clean_revision(manifest, artifact="run_manifest.json")
     regime_config = load_market_regime_config(regime)
     if regime_config.get("execution_mode") != job.timing:
         raise ReconciliationError("market-regime source mode does not match matrix job")
@@ -779,6 +874,49 @@ def reconcile_share_balances(frames: Mapping[str, pd.DataFrame]) -> None:
             )
 
 
+def reconcile_trade_economics(frames: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    nav = _timestamps(frames["nav_5m.csv"], ["timestamp"], "nav_5m.csv")
+    try:
+        reconciled = _reconcile_trade_economics(
+            frames["fills.csv"],
+            frames["trades.csv"],
+            frames["positions.csv"],
+            nav["timestamp"].max(),
+        )
+        metrics = reconciled_trade_metrics(reconciled)
+    except TradeEconomicsError as error:
+        raise ReconciliationError(str(error)) from error
+
+    summary = frames["trade_summary.csv"]
+    if len(summary) != 1:
+        raise ReconciliationError("trade_summary.csv must contain exactly one row")
+    for field in ("closed_trade_count", "open_trade_count"):
+        try:
+            reported = int(summary.iloc[0][field])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ReconciliationError(f"trade_summary.csv has invalid {field}") from error
+        if reported != metrics[field]:
+            raise ReconciliationError(f"trade_summary.csv {field} mismatch")
+    for field in ("win_rate", "profit_factor"):
+        try:
+            reported = float(summary.iloc[0][field])
+        except (TypeError, ValueError) as error:
+            raise ReconciliationError(f"trade_summary.csv has invalid {field}") from error
+        expected = float(metrics[field])
+        matches = (
+            math.isnan(reported) and math.isnan(expected)
+        ) or (
+            math.isinf(expected) and reported == expected
+        ) or (
+            math.isfinite(reported)
+            and math.isfinite(expected)
+            and math.isclose(reported, expected, rel_tol=1e-10, abs_tol=1e-10)
+        )
+        if not matches:
+            raise ReconciliationError(f"trade_summary.csv {field} mismatch")
+    return reconciled
+
+
 def reconcile_position_constraints(frames: Mapping[str, pd.DataFrame]) -> None:
     nav = _numeric(frames["nav_5m.csv"], ["positions"], "nav_5m.csv")
     if (nav["positions"] > 3).any():
@@ -881,6 +1019,14 @@ def reconcile_regime_liquidation_intent(frames: Mapping[str, pd.DataFrame]) -> N
                     )
                 balances[position_id] = balances.get(position_id, 0.0) + shares
             else:
+                if (
+                    position_id in targeted
+                    and balances.get(position_id, 0.0) > 0.0
+                    and fill.reason != "market_regime_exit"
+                ):
+                    raise ReconciliationError(
+                        f"position {position_id}: targeted sell must be market_regime_exit"
+                    )
                 balances[position_id] = balances.get(position_id, 0.0) - shares
                 if balances[position_id] <= 0.0:
                     targeted.discard(position_id)
@@ -941,9 +1087,11 @@ def reconcile_regime_exits(frames: Mapping[str, pd.DataFrame]) -> None:
 
 
 def reconcile_frames(frames: Mapping[str, pd.DataFrame]) -> None:
+    _reject_infinite_economics(frames)
     reconcile_nav(frames)
     reconcile_activity_completeness(frames)
     reconcile_share_balances(frames)
+    reconcile_trade_economics(frames)
     reconcile_position_constraints(frames)
     reconcile_regime_liquidation_intent(frames)
     reconcile_regime_exits(frames)
@@ -965,8 +1113,9 @@ def run_matrix(
     cli_main: Callable[[list[str]], int] = intraday_cli_main,
 ) -> int:
     jobs = build_matrix()
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / RUN_SOURCE_MANIFEST).unlink(missing_ok=True)
     validate_all_schedule_pairs(jobs, repo_root)
-    write_run_source_manifest(output_root, jobs, repo_root)
     for job in jobs:
         argv = cli_arguments(
             job,
@@ -978,6 +1127,7 @@ def run_matrix(
         if exit_code != 0:
             raise RuntimeError(f"{job.run_key}: intraday CLI returned exit code {exit_code}")
         reconcile_run_artifacts(output_root / job.run_key, job, repo_root)
+    write_run_source_manifest(output_root, jobs, repo_root)
     return len(jobs)
 
 

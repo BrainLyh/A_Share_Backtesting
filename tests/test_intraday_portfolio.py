@@ -193,6 +193,59 @@ class PortfolioChronologyTests(unittest.TestCase):
         self.assertIn(blocked_code, result.candidates["code"].tolist())
         self.assertIn("market_regime_off", set(result.rejections["reason"]))
 
+    def test_crossed_transitions_survive_whole_absent_sessions(self) -> None:
+        held_code = "600001"
+        trading_dates = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04"]
+        minute_dates = [trading_dates[0], trading_dates[-1]]
+        prices = {
+            (trading_dates[-1], "14:40"): (9.7, 10.1, 9.6, 10.0),
+        }
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": trading_dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "next_session_0935",
+                "events": [
+                    {
+                        "signal_date": trading_dates[0],
+                        "event": "down",
+                        "label": "absent_session_exit",
+                    },
+                    {
+                        "signal_date": trading_dates[1],
+                        "event": "up",
+                        "label": "absent_session_reopen",
+                    },
+                ],
+            },
+            pd.to_datetime(trading_dates),
+        )
+
+        result = run_intraday_portfolio(
+            {held_code: daily_frame(held_code, trading_dates)},
+            {held_code: minute_frame(held_code, minute_dates, prices)},
+            {},
+            ExecutionConfig(),
+            pd.Timestamp(trading_dates[0]),
+            pd.Timestamp(trading_dates[-1]),
+            candidate_provider=candidates_for({trading_dates[0]: [held_code]}),
+            market_regime=schedule,
+        )
+
+        sells = result.fills.loc[result.fills["side"].eq("sell")]
+        self.assertEqual(len(sells), 1)
+        sell = sells.iloc[0]
+        self.assertEqual(sell["reason"], "market_regime_exit")
+        self.assertEqual(sell["timestamp"], pd.Timestamp("2026-07-04 14:40"))
+        self.assertAlmostEqual(sell["adjusted_price"], 9.7 * 0.9995)
+        self.assertEqual(
+            result.market_regime["effective_timestamp"].tolist(),
+            [
+                pd.Timestamp("2026-07-02 09:35"),
+                pd.Timestamp("2026-07-03 09:35"),
+            ],
+        )
+
     def test_same_day_regime_intent_survives_missing_transition_bar_until_reconciled(self) -> None:
         held_code, candidate_code = "600001", "600002"
         dates = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04"]

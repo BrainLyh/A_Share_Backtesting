@@ -58,6 +58,10 @@ class MarketRegimeSchedule:
             ],
         )
 
+    @property
+    def transitions(self) -> tuple[RegimeTransition, ...]:
+        return self._transitions
+
     def state_at(self, timestamp: pd.Timestamp) -> str:
         state = self._initial_state
         instant = pd.Timestamp(timestamp)

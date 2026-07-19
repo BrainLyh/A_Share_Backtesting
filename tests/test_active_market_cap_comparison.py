@@ -177,12 +177,18 @@ class ScheduleSafetyTests(unittest.TestCase):
         cli = Mock(return_value=0)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
+            stale_manifest = output / driver.RUN_SOURCE_MANIFEST
+            stale_manifest.write_text("stale\n", encoding="utf-8")
+            sentinel = output / "preserve.me"
+            sentinel.write_text("keep\n", encoding="utf-8")
             with (
                 patch.object(driver, "validate_all_schedule_pairs", side_effect=ValueError("state windows differ")),
                 patch.object(driver, "write_run_source_manifest"),
             ):
                 with self.assertRaisesRegex(ValueError, "state windows differ"):
                     driver.run_matrix(Path("D:/minute"), output, cli_main=cli)
+            self.assertFalse(stale_manifest.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
 
         cli.assert_not_called()
 
@@ -213,12 +219,37 @@ class DriverFailureTests(unittest.TestCase):
 
         self.assertEqual(cli.call_count, 1)
 
+    def test_failed_rerun_does_not_leave_stale_root_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            manifest = output / driver.RUN_SOURCE_MANIFEST
+            manifest.write_text("stale\n", encoding="utf-8")
+            sentinel = output / "preserve.me"
+            sentinel.write_text("keep\n", encoding="utf-8")
+            cli = Mock(return_value=7)
+            with (
+                patch.object(driver, "validate_all_schedule_pairs"),
+                patch.object(driver, "write_run_source_manifest"),
+                patch.object(driver, "reconcile_run_artifacts"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exit code 7"):
+                    driver.run_matrix(Path("D:/minute"), output, cli_main=cli)
+
+            self.assertFalse(manifest.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+
 
 class ManifestTests(unittest.TestCase):
     def test_run_source_manifest_is_deterministic_and_repository_relative(self) -> None:
         jobs = driver.build_matrix()
         paths = driver.frozen_source_paths(jobs)
-        hashes = {path: f"sha256-{index:02d}" for index, path in enumerate(reversed(paths))}
+        timed_paths = tuple(
+            f"{job.run_key}/run_manifest.json" for job in jobs
+        )
+        hashes = {
+            path: f"sha256-{index:02d}"
+            for index, path in enumerate(reversed((*paths, *timed_paths)))
+        }
 
         first = driver.serialize_run_source_manifest(jobs, hashes)
         second = driver.serialize_run_source_manifest(jobs, dict(reversed(list(hashes.items()))))
@@ -227,7 +258,18 @@ class ManifestTests(unittest.TestCase):
         payload = json.loads(first)
         self.assertEqual(len(payload["runs"]), 16)
         self.assertEqual(list(payload["source_sha256"]), sorted(paths))
+        self.assertIn("timed_run_manifest_sha256", payload)
+        self.assertEqual(
+            list(payload["timed_run_manifest_sha256"]), sorted(timed_paths)
+        )
+        self.assertEqual(len(payload["timed_run_manifest_sha256"]), 16)
         self.assertTrue(all(not Path(path).is_absolute() for path in payload["source_sha256"]))
+        self.assertTrue(
+            all(
+                not Path(path).is_absolute()
+                for path in payload["timed_run_manifest_sha256"]
+            )
+        )
         self.assertIn(
             "outputs/intraday_b1_final_verified_20260718/"
             "ai_canonical_20260717/nav_daily.csv",
@@ -474,12 +516,37 @@ def prepare_frozen_repo(root: Path) -> None:
     calendar = pd.DataFrame(
         {"date": pd.bdate_range("2026-06-01", "2026-07-20").strftime("%Y-%m-%d")}
     ).to_csv(index=False)
-    for baseline in driver.BASELINE_SOURCES.values():
+    baseline_jobs = {job.baseline: job for job in jobs}
+    for baseline, job in baseline_jobs.items():
         _write(root / baseline / "nav_daily.csv", calendar)
         minute_hash = hashlib.sha256(baseline.encode("utf-8")).hexdigest()
+        qfq = root / job.qfq_source
+        pool = root / job.stock_pool
+        config = root / job.config
+        scan = root / job.scan_source
         _write(
             root / baseline / "run_manifest.json",
-            json.dumps({"minute_source_sha256": minute_hash}),
+            json.dumps(
+                {
+                    "mode": "intraday-b1-portfolio",
+                    "analysis_start": driver.ANALYSIS_START,
+                    "analysis_end": driver.ANALYSIS_END,
+                    "qfq_source": str(qfq.resolve()),
+                    "qfq_source_sha256": _runner_file_source_sha256(qfq),
+                    "stock_pool_sha256": _file_sha256(pool),
+                    "config_sha256": _file_sha256(config),
+                    "scan_source": str(scan.resolve()),
+                    "scan_source_sha256": _file_sha256(scan),
+                    "minute_source_sha256": minute_hash,
+                    "git_revision": "baseline-revision",
+                    "git_dirty": False,
+                    "execution_config": {
+                        "target_fraction": driver.POSITION_CONFIGS[
+                            job.position
+                        ].target_fraction,
+                    },
+                }
+            ),
         )
 
 
@@ -508,6 +575,8 @@ def valid_manifest(job: driver.MatrixRun, repo_root: Path) -> dict[str, object]:
         "market_regime_source": str(regime.resolve()),
         "market_regime_source_sha256": _file_sha256(regime),
         "minute_source_sha256": baseline_manifest["minute_source_sha256"],
+        "git_revision": "timed-revision",
+        "git_dirty": False,
         "outputs": [*driver.REQUIRED_OUTPUTS, "market_regime.csv"],
     }
 
@@ -646,6 +715,25 @@ class ArtifactReconciliationTests(unittest.TestCase):
         ):
             driver.reconcile_regime_liquidation_intent(frames)
 
+    def test_targeted_position_rejects_non_regime_partial_sell(self) -> None:
+        frames = valid_frames()
+        frames["fills.csv"].loc[1, "reason"] = "stop_loss"
+
+        with self.assertRaisesRegex(
+            driver.ReconciliationError, "targeted sell must be market_regime_exit"
+        ):
+            driver.reconcile_regime_liquidation_intent(frames)
+
+    def test_targeted_position_rejects_non_regime_full_sell(self) -> None:
+        frames = valid_frames()
+        frames["fills.csv"].loc[1, "reason"] = "stop_loss"
+        frames["fills.csv"].loc[1, "shares"] = 100
+
+        with self.assertRaisesRegex(
+            driver.ReconciliationError, "targeted sell must be market_regime_exit"
+        ):
+            driver.reconcile_regime_liquidation_intent(frames)
+
     def test_same_timestamp_exit_must_precede_entry_after_reopen(self) -> None:
         frames = valid_frames()
         frames["market_regime.csv"] = pd.concat(
@@ -695,6 +783,40 @@ class ArtifactReconciliationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(driver.ReconciliationError, "regime shares do not reconcile"):
             driver.reconcile_regime_exits(frames)
+
+    def test_trade_economics_are_rebuilt_from_fills_and_final_mark(self) -> None:
+        mutations = {
+            "entry_cost": 999.0,
+            "net_proceeds": 599.0,
+            "net_pnl": 1.0,
+            "net_return": 0.01,
+            "entry_timestamp": "2026-06-02 14:50:00",
+            "exit_timestamp": "2026-06-03 15:00:00",
+            "exit_reason": "expiry",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                frames = valid_frames()
+                frames["trades.csv"].loc[0, field] = value
+                with self.assertRaisesRegex(driver.ReconciliationError, field):
+                    driver.reconcile_frames(frames)
+
+    def test_all_non_profit_factor_economic_inputs_reject_infinity(self) -> None:
+        cases = (
+            ("nav_daily.csv", "nav"),
+            ("portfolio_summary.csv", "average_exposure"),
+            ("trade_summary.csv", "mean_net_return"),
+            ("comparison.csv", "total_net_return"),
+        )
+        for artifact, field in cases:
+            for value in (float("inf"), float("-inf")):
+                with self.subTest(artifact=artifact, field=field, value=value):
+                    frames = valid_frames()
+                    frames[artifact].loc[0, field] = value
+                    with self.assertRaisesRegex(
+                        driver.ReconciliationError, f"{artifact}.*{field}"
+                    ):
+                        driver.reconcile_frames(frames)
 
     def test_artifact_parser_rejects_schema_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -749,6 +871,64 @@ class ArtifactReconciliationTests(unittest.TestCase):
             write_run_artifacts(run_dir, valid_frames(), missing_minute_hash)
             with self.assertRaisesRegex(driver.ReconciliationError, "minute_source_sha256"):
                 driver.parse_run_artifacts(run_dir, job, repo_root)
+
+    def test_baseline_manifest_semantic_mutations_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            write_run_artifacts(run_dir, valid_frames(), valid_manifest(job, repo_root))
+            baseline_path = repo_root / job.baseline / "run_manifest.json"
+            original = json.loads(baseline_path.read_text(encoding="utf-8"))
+            mutations = {
+                "mode": ("mode", "wrong-mode"),
+                "analysis start": ("analysis_start", "2026-06-02"),
+                "analysis end": ("analysis_end", "2026-07-16"),
+                "qfq path": ("qfq_source", str((repo_root / "wrong.csv").resolve())),
+                "qfq hash": ("qfq_source_sha256", "1" * 64),
+                "pool hash": ("stock_pool_sha256", "2" * 64),
+                "config hash": ("config_sha256", "3" * 64),
+                "scan path": ("scan_source", str((repo_root / "wrong.csv").resolve())),
+                "scan hash": ("scan_source_sha256", "4" * 64),
+                "dirty": ("git_dirty", True),
+                "empty revision": ("git_revision", ""),
+            }
+            for label, (field, value) in mutations.items():
+                with self.subTest(label=label):
+                    bad = json.loads(json.dumps(original))
+                    bad[field] = value
+                    baseline_path.write_text(json.dumps(bad), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        driver.ReconciliationError, "frozen baseline run_manifest.json"
+                    ):
+                        driver.parse_run_artifacts(run_dir, job, repo_root)
+                    baseline_path.write_text(json.dumps(original), encoding="utf-8")
+
+            bad = json.loads(json.dumps(original))
+            bad["execution_config"]["target_fraction"] = 0.25
+            baseline_path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaisesRegex(
+                driver.ReconciliationError, "frozen baseline run_manifest.json"
+            ):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
+    def test_timed_manifest_requires_clean_nonempty_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            manifest = valid_manifest(job, repo_root)
+            for field, value in (("git_dirty", True), ("git_revision", "  ")):
+                with self.subTest(field=field):
+                    write_run_artifacts(
+                        run_dir,
+                        valid_frames(),
+                        {**manifest, field: value},
+                    )
+                    with self.assertRaisesRegex(driver.ReconciliationError, field):
+                        driver.parse_run_artifacts(run_dir, job, repo_root)
 
     def test_artifact_parser_rejects_header_only_critical_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -836,6 +1016,9 @@ class SyntheticMatrixIntegrationTests(unittest.TestCase):
                 arguments = dict(zip(argv[::2], argv[1::2]))
                 run_dir = Path(arguments["--output"])
                 job = jobs[run_dir.name]
+                self.assertFalse(
+                    (output_root / driver.RUN_SOURCE_MANIFEST).exists()
+                )
                 calls.append(job.run_key)
                 frames = all_cash_frames(job.timing)
                 write_run_artifacts(
@@ -855,6 +1038,14 @@ class SyntheticMatrixIntegrationTests(unittest.TestCase):
             self.assertEqual(completed, 16)
             self.assertEqual(calls, [job.run_key for job in driver.build_matrix()])
             self.assertTrue((output_root / driver.RUN_SOURCE_MANIFEST).is_file())
+            root_manifest = json.loads(
+                (output_root / driver.RUN_SOURCE_MANIFEST).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(root_manifest["timed_run_manifest_sha256"]), 16)
+            for relative, expected_hash in root_manifest[
+                "timed_run_manifest_sha256"
+            ].items():
+                self.assertEqual(_file_sha256(output_root / relative), expected_hash)
             self.assertEqual(
                 len([path for path in output_root.iterdir() if path.is_dir()]),
                 16,
