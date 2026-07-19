@@ -204,6 +204,8 @@ Check ending cash plus marked positions equals NAV, sold shares never exceed bou
 ### Task 6: Compact Comparison and Research Interpretation
 
 **Files:**
+- Create: `tools/summarize_active_market_cap_comparison.py`
+- Create: `tests/test_active_market_cap_summary.py`
 - Create: `outputs/intraday_b1_active_market_cap_20260719_summary/timing_comparison.csv`
 - Create: `outputs/intraday_b1_active_market_cap_20260719_summary/regime_timeline_comparison.csv`
 - Create: `outputs/intraday_b1_active_market_cap_20260719_summary/run_sources.json`
