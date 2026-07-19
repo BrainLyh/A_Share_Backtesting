@@ -437,13 +437,22 @@ def _numeric(frame: pd.DataFrame, columns: Sequence[str], artifact: str) -> pd.D
     return converted
 
 
-def _timestamps(frame: pd.DataFrame, columns: Sequence[str], artifact: str) -> pd.DataFrame:
+def _timestamps(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    artifact: str,
+    *,
+    nullable: Sequence[str] = (),
+) -> pd.DataFrame:
     converted = frame.copy()
+    nullable_columns = set(nullable)
     for column in columns:
         values = pd.to_datetime(converted[column], errors="coerce")
         invalid = converted[column].notna() & values.isna()
         if invalid.any():
             raise ReconciliationError(f"{artifact} has invalid timestamp {column}")
+        if column not in nullable_columns and values.isna().any():
+            raise ReconciliationError(f"{artifact} has null required timestamp {column}")
         converted[column] = values
     return converted
 
@@ -477,6 +486,24 @@ def _validate_run_manifest(
     config = repo_root / job.config
     scan = repo_root / job.scan_source
     regime = repo_root / job.single_day_config
+    baseline_manifest_path = repo_root / job.baseline / "run_manifest.json"
+    try:
+        baseline_manifest = json.loads(
+            baseline_manifest_path.read_text(encoding="utf-8")
+        )
+    except Exception as error:
+        raise ReconciliationError(
+            f"cannot parse frozen baseline run_manifest.json: {error}"
+        ) from error
+    baseline_minute_hash = (
+        baseline_manifest.get("minute_source_sha256")
+        if isinstance(baseline_manifest, Mapping)
+        else None
+    )
+    if not isinstance(baseline_minute_hash, str) or not baseline_minute_hash:
+        raise ReconciliationError(
+            "frozen baseline run_manifest.json lacks minute_source_sha256"
+        )
     expected = {
         "mode": "intraday-b1-portfolio",
         "analysis_start": ANALYSIS_START,
@@ -489,6 +516,7 @@ def _validate_run_manifest(
         "scan_source_sha256": _sha256_file(scan),
         "market_regime_source": str(regime.resolve()),
         "market_regime_source_sha256": _sha256_file(regime),
+        "minute_source_sha256": baseline_minute_hash,
         "outputs": [*REQUIRED_OUTPUTS, "market_regime.csv"],
     }
     for field, value in expected.items():
@@ -513,6 +541,25 @@ def _validate_run_manifest(
         raise ReconciliationError("market-regime source mode does not match matrix job")
 
 
+def _validate_artifact_timestamps(frames: Mapping[str, pd.DataFrame]) -> None:
+    for artifact in ("fills.csv", "nav_5m.csv", "nav_daily.csv", "positions.csv"):
+        _timestamps(frames[artifact], ["timestamp"], artifact)
+    trades = _timestamps(
+        frames["trades.csv"],
+        ["entry_timestamp", "exit_timestamp"],
+        "trades.csv",
+        nullable=["exit_timestamp"],
+    )
+    closed_without_exit = trades["status"].eq("closed") & trades["exit_timestamp"].isna()
+    if closed_without_exit.any():
+        raise ReconciliationError("trades.csv closed trade exit timestamp is required")
+    _timestamps(
+        frames["market_regime.csv"],
+        ["effective_timestamp"],
+        "market_regime.csv",
+    )
+
+
 def parse_run_artifacts(
     run_dir: Path,
     job: MatrixRun,
@@ -532,6 +579,8 @@ def parse_run_artifacts(
                 f"{filename} schema drift: {frame.columns.tolist()} != {expected_columns}"
             )
         frames[filename] = frame
+
+    _validate_artifact_timestamps(frames)
 
     for filename in (
         "market_regime.csv",
@@ -587,6 +636,74 @@ def reconcile_nav(frames: Mapping[str, pd.DataFrame]) -> None:
         raise ReconciliationError("portfolio summary final NAV does not reconcile")
 
 
+def reconcile_activity_completeness(frames: Mapping[str, pd.DataFrame]) -> None:
+    nav = _timestamps(frames["nav_5m.csv"], ["timestamp"], "nav_5m.csv")
+    nav = _numeric(nav, ["positions", "gross_exposure"], "nav_5m.csv")
+    trade_summary = _numeric(
+        frames["trade_summary.csv"],
+        ["open_trade_count", "closed_trade_count"],
+        "trade_summary.csv",
+    )
+    if len(trade_summary) != 1:
+        raise ReconciliationError("trade_summary.csv must contain exactly one row")
+    open_count = int(trade_summary.iloc[0]["open_trade_count"])
+    closed_count = int(trade_summary.iloc[0]["closed_trade_count"])
+    if open_count < 0 or closed_count < 0:
+        raise ReconciliationError("trade summary counts must not be negative")
+    nav_reports_activity = bool(
+        (nav["positions"] > 0).any()
+        or (nav["gross_exposure"].abs() > 1e-6).any()
+    )
+    if nav_reports_activity or open_count > 0 or closed_count > 0:
+        empty_ledgers = [
+            artifact
+            for artifact in ("fills.csv", "trades.csv", "positions.csv")
+            if frames[artifact].empty
+        ]
+        if empty_ledgers:
+            raise ReconciliationError(
+                f"reported activity requires nonempty core ledgers: {empty_ledgers}"
+            )
+
+    positions = _timestamps(frames["positions.csv"], ["timestamp"], "positions.csv")
+    positions = _numeric(positions, ["market_value"], "positions.csv")
+    trades = _timestamps(
+        frames["trades.csv"],
+        ["entry_timestamp", "exit_timestamp"],
+        "trades.csv",
+        nullable=["exit_timestamp"],
+    )
+    actual_open = set(
+        trades.loc[trades["status"].eq("open"), "position_id"].astype(str)
+    )
+    actual_closed = set(
+        trades.loc[trades["status"].eq("closed"), "position_id"].astype(str)
+    )
+    if len(actual_open) != open_count or len(actual_closed) != closed_count:
+        raise ReconciliationError("trade summary counts do not match trade ledger")
+
+    ending = nav.sort_values("timestamp").iloc[-1]
+    final_positions = positions.loc[positions["timestamp"].eq(ending.timestamp)]
+    final_ids = set(final_positions["position_id"].astype(str))
+    nav_position_count = int(ending.positions)
+    if final_ids != actual_open:
+        raise ReconciliationError("final open trade IDs do not match position snapshots")
+    if len(final_positions) != nav_position_count or len(actual_open) != nav_position_count:
+        raise ReconciliationError(
+            "final holding count does not match nav.positions"
+        )
+    final_market_value = float(final_positions["market_value"].sum())
+    if not math.isclose(
+        final_market_value,
+        float(ending.gross_exposure),
+        rel_tol=1e-12,
+        abs_tol=1e-6,
+    ):
+        raise ReconciliationError(
+            "final position market_value does not match NAV gross exposure"
+        )
+
+
 def _normalized_fills(frames: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     fills = _timestamps(frames["fills.csv"], ["timestamp"], "fills.csv")
     fills = _numeric(fills, ["shares"], "fills.csv")
@@ -613,7 +730,10 @@ def reconcile_share_balances(frames: Mapping[str, pd.DataFrame]) -> None:
     remainder = final_positions.set_index("position_id")["remaining_shares"].to_dict()
 
     trades = _timestamps(
-        frames["trades.csv"], ["entry_timestamp", "exit_timestamp"], "trades.csv"
+        frames["trades.csv"],
+        ["entry_timestamp", "exit_timestamp"],
+        "trades.csv",
+        nullable=["exit_timestamp"],
     )
     if trades["position_id"].duplicated().any():
         raise ReconciliationError("trades.csv has duplicate position_id")
@@ -678,7 +798,10 @@ def reconcile_position_constraints(frames: Mapping[str, pd.DataFrame]) -> None:
             raise ReconciliationError("position snapshots have more than 3 holdings")
 
     trades = _timestamps(
-        frames["trades.csv"], ["entry_timestamp", "exit_timestamp"], "trades.csv"
+        frames["trades.csv"],
+        ["entry_timestamp", "exit_timestamp"],
+        "trades.csv",
+        nullable=["exit_timestamp"],
     )
     for code, group in trades.groupby("code", sort=True):
         prior_exit: pd.Timestamp | None = None
@@ -819,6 +942,7 @@ def reconcile_regime_exits(frames: Mapping[str, pd.DataFrame]) -> None:
 
 def reconcile_frames(frames: Mapping[str, pd.DataFrame]) -> None:
     reconcile_nav(frames)
+    reconcile_activity_completeness(frames)
     reconcile_share_balances(frames)
     reconcile_position_constraints(frames)
     reconcile_regime_liquidation_intent(frames)

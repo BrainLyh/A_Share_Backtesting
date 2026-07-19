@@ -407,6 +407,24 @@ def valid_frames(execution_mode: str = "same_day_1455") -> dict[str, pd.DataFram
     return frames
 
 
+def all_cash_frames(execution_mode: str = "same_day_1455") -> dict[str, pd.DataFrame]:
+    frames = valid_frames(execution_mode)
+    for artifact in ("fills.csv", "positions.csv", "trades.csv"):
+        frames[artifact] = _empty(driver.CSV_SCHEMAS[artifact])
+    frames["nav_5m.csv"].loc[:, ["cash", "nav", "nav_low"]] = 1000.0
+    frames["nav_5m.csv"].loc[:, "gross_exposure"] = 0.0
+    frames["nav_5m.csv"].loc[:, "positions"] = 0
+    frames["nav_daily.csv"] = frames["nav_5m.csv"].copy()
+    frames["portfolio_summary.csv"].loc[0, "max_positions"] = 0
+    frames["trade_summary.csv"].loc[0, "open_trade_count"] = 0
+    frames["comparison.csv"] = frames["portfolio_summary.csv"].assign(
+        mode="intraday_portfolio",
+        start=driver.ANALYSIS_START,
+        end=driver.ANALYSIS_END,
+    )
+    return frames
+
+
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -458,7 +476,11 @@ def prepare_frozen_repo(root: Path) -> None:
     ).to_csv(index=False)
     for baseline in driver.BASELINE_SOURCES.values():
         _write(root / baseline / "nav_daily.csv", calendar)
-        _write(root / baseline / "run_manifest.json", "{}\n")
+        minute_hash = hashlib.sha256(baseline.encode("utf-8")).hexdigest()
+        _write(
+            root / baseline / "run_manifest.json",
+            json.dumps({"minute_source_sha256": minute_hash}),
+        )
 
 
 def valid_manifest(job: driver.MatrixRun, repo_root: Path) -> dict[str, object]:
@@ -467,6 +489,9 @@ def valid_manifest(job: driver.MatrixRun, repo_root: Path) -> dict[str, object]:
     config = repo_root / job.config
     scan = repo_root / job.scan_source
     regime = repo_root / job.single_day_config
+    baseline_manifest = json.loads(
+        (repo_root / job.baseline / "run_manifest.json").read_text(encoding="utf-8")
+    )
     return {
         "mode": "intraday-b1-portfolio",
         "analysis_start": driver.ANALYSIS_START,
@@ -482,6 +507,7 @@ def valid_manifest(job: driver.MatrixRun, repo_root: Path) -> dict[str, object]:
         },
         "market_regime_source": str(regime.resolve()),
         "market_regime_source_sha256": _file_sha256(regime),
+        "minute_source_sha256": baseline_manifest["minute_source_sha256"],
         "outputs": [*driver.REQUIRED_OUTPUTS, "market_regime.csv"],
     }
 
@@ -503,6 +529,32 @@ class ArtifactReconciliationTests(unittest.TestCase):
         frames = valid_frames()
 
         driver.reconcile_frames(frames)
+
+    def test_active_ledgers_reconcile_to_final_nav_holdings_and_exposure(self) -> None:
+        driver.reconcile_frames(valid_frames())
+
+    def test_all_cash_no_trade_run_accepts_empty_core_ledgers(self) -> None:
+        driver.reconcile_frames(all_cash_frames())
+
+    def test_reported_holding_rejects_header_only_core_ledgers(self) -> None:
+        frames = valid_frames()
+        for artifact in ("fills.csv", "positions.csv", "trades.csv"):
+            frames[artifact] = _empty(driver.CSV_SCHEMAS[artifact])
+
+        with self.assertRaisesRegex(driver.ReconciliationError, "activity requires nonempty"):
+            driver.reconcile_frames(frames)
+
+    def test_final_position_count_and_market_value_must_match_nav(self) -> None:
+        frames = valid_frames()
+        frames["positions.csv"].loc[1, "market_value"] = 399.0
+
+        with self.assertRaisesRegex(driver.ReconciliationError, "gross exposure"):
+            driver.reconcile_frames(frames)
+
+        frames = valid_frames()
+        frames["nav_5m.csv"].loc[0, "positions"] = 2
+        with self.assertRaisesRegex(driver.ReconciliationError, "final holding count"):
+            driver.reconcile_frames(frames)
 
     def test_ending_cash_plus_exposure_must_equal_nav(self) -> None:
         frames = valid_frames()
@@ -677,6 +729,7 @@ class ArtifactReconciliationTests(unittest.TestCase):
                     str((repo_root / "wrong.json").resolve()),
                 ),
                 "regime hash": ("market_regime_source_sha256", "5" * 64),
+                "minute source hash": ("minute_source_sha256", "6" * 64),
                 "outputs": ("outputs", []),
             }
             for label, (field, value) in mismatch_cases.items():
@@ -689,6 +742,12 @@ class ArtifactReconciliationTests(unittest.TestCase):
             bad = {**manifest, "execution_config": {"target_fraction": 0.25}}
             write_run_artifacts(run_dir, valid_frames(), bad)
             with self.assertRaisesRegex(driver.ReconciliationError, "target fraction"):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
+            missing_minute_hash = dict(manifest)
+            missing_minute_hash.pop("minute_source_sha256")
+            write_run_artifacts(run_dir, valid_frames(), missing_minute_hash)
+            with self.assertRaisesRegex(driver.ReconciliationError, "minute_source_sha256"):
                 driver.parse_run_artifacts(run_dir, job, repo_root)
 
     def test_artifact_parser_rejects_header_only_critical_artifacts(self) -> None:
@@ -724,6 +783,45 @@ class ArtifactReconciliationTests(unittest.TestCase):
             with self.assertRaisesRegex(driver.ReconciliationError, "timeline mode"):
                 driver.parse_run_artifacts(run_dir, job, repo_root)
 
+    def test_artifact_parser_rejects_null_required_timestamps(self) -> None:
+        cases = (
+            ("fills.csv", "timestamp"),
+            ("nav_5m.csv", "timestamp"),
+            ("nav_daily.csv", "timestamp"),
+            ("positions.csv", "timestamp"),
+            ("trades.csv", "entry_timestamp"),
+            ("market_regime.csv", "effective_timestamp"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            for artifact, column in cases:
+                with self.subTest(artifact=artifact, column=column):
+                    frames = valid_frames()
+                    frames[artifact].loc[0, column] = pd.NA
+                    write_run_artifacts(run_dir, frames, valid_manifest(job, repo_root))
+                    with self.assertRaisesRegex(
+                        driver.ReconciliationError, "required timestamp"
+                    ):
+                        driver.parse_run_artifacts(run_dir, job, repo_root)
+
+    def test_only_open_trade_may_have_null_exit_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            frames = valid_frames()
+            write_run_artifacts(run_dir, frames, valid_manifest(job, repo_root))
+            driver.parse_run_artifacts(run_dir, job, repo_root)
+
+            frames["trades.csv"].loc[0, "status"] = "closed"
+            write_run_artifacts(run_dir, frames, valid_manifest(job, repo_root))
+            with self.assertRaisesRegex(driver.ReconciliationError, "closed trade exit"):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
 
 class SyntheticMatrixIntegrationTests(unittest.TestCase):
     def test_all_sixteen_jobs_run_through_real_validation_manifest_and_reconciliation(self) -> None:
@@ -739,21 +837,7 @@ class SyntheticMatrixIntegrationTests(unittest.TestCase):
                 run_dir = Path(arguments["--output"])
                 job = jobs[run_dir.name]
                 calls.append(job.run_key)
-                frames = valid_frames(job.timing)
-                frames["fills.csv"] = _empty(driver.CSV_SCHEMAS["fills.csv"])
-                frames["positions.csv"] = _empty(driver.CSV_SCHEMAS["positions.csv"])
-                frames["trades.csv"] = _empty(driver.CSV_SCHEMAS["trades.csv"])
-                frames["nav_5m.csv"].loc[:, ["cash", "nav", "nav_low"]] = 1000.0
-                frames["nav_5m.csv"].loc[:, "gross_exposure"] = 0.0
-                frames["nav_5m.csv"].loc[:, "positions"] = 0
-                frames["nav_daily.csv"] = frames["nav_5m.csv"].copy()
-                frames["portfolio_summary.csv"].loc[0, "max_positions"] = 0
-                frames["trade_summary.csv"].loc[0, "open_trade_count"] = 0
-                frames["comparison.csv"] = frames["portfolio_summary.csv"].assign(
-                    mode="intraday_portfolio",
-                    start=driver.ANALYSIS_START,
-                    end=driver.ANALYSIS_END,
-                )
+                frames = all_cash_frames(job.timing)
                 write_run_artifacts(
                     run_dir,
                     frames,
