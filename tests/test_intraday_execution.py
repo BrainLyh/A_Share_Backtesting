@@ -4,6 +4,7 @@ import pandas as pd
 
 from a_share_backtesting.intraday_execution import (
     ExecutionConfig,
+    PendingExit,
     commission,
     entry_fill,
     is_one_price_limit,
@@ -94,6 +95,103 @@ class EntryExecutionTests(unittest.TestCase):
 
 
 class ExitExecutionTests(unittest.TestCase):
+    def test_regime_exit_wins_conflicting_orders_and_uses_trigger_price(self) -> None:
+        position = opened_position()
+        timestamp = pd.Timestamp("2026-07-07 09:35")
+        regime = PendingExit("market_regime_exit", position.remaining_shares, 10.25, timestamp)
+        result = process_exit_bar(
+            position,
+            [
+                PendingExit("stop_loss", position.remaining_shares, 9.0, timestamp),
+                PendingExit("take_profit_10", position.tp1_target_shares, 11.0, timestamp),
+                regime,
+            ],
+            bar(str(timestamp), open_=9.0, high=12.5, low=8.9, close=11.0),
+            ExecutionConfig(),
+        )
+
+        self.assertEqual([fill.reason for fill in result.fills], ["market_regime_exit"])
+        self.assertAlmostEqual(result.fills[0].raw_price, 10.25 * 0.9995)
+        self.assertEqual(result.position.remaining_shares, 0)
+        self.assertEqual(result.pending, [])
+
+    def test_regime_exit_replaces_other_orders_when_lower_limit_locked(self) -> None:
+        position = opened_position()
+        timestamp = pd.Timestamp("2026-07-07 09:35")
+        regime = PendingExit("market_regime_exit", position.remaining_shares, 9.0, timestamp)
+        locked = bar(str(timestamp), open_=9.0, high=9.0, low=9.0, close=9.0, preclose=10.0)
+
+        result = process_exit_bar(
+            position,
+            [PendingExit("stop_loss", position.remaining_shares, 9.0, timestamp), regime],
+            locked,
+            ExecutionConfig(),
+        )
+
+        self.assertEqual(result.fills, [])
+        self.assertEqual(result.pending, [regime])
+        self.assertEqual(result.rejections, ["lower_limit_lock"])
+
+    def test_regime_exit_replaces_other_orders_when_volume_is_zero(self) -> None:
+        position = opened_position()
+        timestamp = pd.Timestamp("2026-07-07 09:35")
+        regime = PendingExit("market_regime_exit", position.remaining_shares, 10.0, timestamp)
+
+        result = process_exit_bar(
+            position,
+            [PendingExit("take_profit_10", position.tp1_target_shares, 11.0, timestamp), regime],
+            bar(str(timestamp), high=12.0, volume=0),
+            ExecutionConfig(),
+        )
+
+        self.assertEqual(result.fills, [])
+        self.assertEqual(result.pending, [regime])
+        self.assertEqual(result.rejections, ["volume_cap_below_one_lot"])
+
+    def test_partial_regime_exit_keeps_only_remainder_and_uses_next_open(self) -> None:
+        position = opened_position()
+        timestamp = pd.Timestamp("2026-07-07 10:00")
+        regime = PendingExit("market_regime_exit", position.remaining_shares, 10.25, timestamp)
+        first = process_exit_bar(
+            position,
+            [PendingExit("take_profit_10", position.tp1_target_shares, 11.0, timestamp), regime],
+            bar(str(timestamp), high=12.0, volume=10_000),
+            ExecutionConfig(),
+        )
+
+        self.assertEqual([fill.reason for fill in first.fills], ["market_regime_exit"])
+        self.assertEqual(first.fills[0].shares, 1_000)
+        self.assertEqual(first.pending, [PendingExit("market_regime_exit", 8_900, 10.25, timestamp)])
+
+        second = process_exit_bar(
+            first.position,
+            first.pending,
+            bar("2026-07-07 10:05", open_=10.7, volume=100_000),
+            ExecutionConfig(),
+        )
+
+        self.assertEqual([fill.reason for fill in second.fills], ["market_regime_exit"])
+        self.assertEqual(second.fills[0].shares, 8_900)
+        self.assertAlmostEqual(second.fills[0].raw_price, 10.7 * 0.9995)
+        self.assertEqual(second.position.remaining_shares, 0)
+        self.assertEqual(second.pending, [])
+
+    def test_entry_day_regime_exit_remains_pending_without_other_sell_orders(self) -> None:
+        position = opened_position()
+        timestamp = pd.Timestamp("2026-07-06 15:00")
+        regime = PendingExit("market_regime_exit", position.remaining_shares, 10.0, timestamp)
+
+        result = process_exit_bar(
+            position,
+            [PendingExit("stop_loss", position.remaining_shares, 9.0, timestamp), regime],
+            bar(str(timestamp), high=12.0, low=8.0),
+            ExecutionConfig(),
+        )
+
+        self.assertEqual(result.fills, [])
+        self.assertEqual(result.pending, [regime])
+        self.assertEqual(result.position.remaining_shares, position.remaining_shares)
+
     def test_t_plus_one_blocks_entry_day_exit(self) -> None:
         position = opened_position()
         result = process_exit_bar(position, [], bar("2026-07-06 15:00", high=12.5, low=8.0), ExecutionConfig())

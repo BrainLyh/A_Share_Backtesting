@@ -281,12 +281,29 @@ def process_exit_bar(
     orders = list(pending)
     fills: list[Fill] = []
     rejections: list[str] = []
+    regime_order = _pending_for(orders, "market_regime_exit")
+    if regime_order is not None:
+        orders = [regime_order]
     if timestamp.normalize() <= current.entry_date or current.remaining_shares <= 0:
         peak = max(current.peak_adjusted_close, prices["close"]) if current.remaining_shares > 0 else current.peak_adjusted_close
         return ExitResult(replace(current, peak_adjusted_close=peak), orders, fills, rejections)
 
     available = _lot_floor(int(bar.get("volume", 0)) * config.participation_rate, config.lot_size)
     locked_lower = is_one_price_limit(bar, "sell")
+
+    if regime_order is not None:
+        if locked_lower or available <= 0:
+            rejections.append("lower_limit_lock" if locked_lower else "volume_cap_below_one_lot")
+            peak = max(current.peak_adjusted_close, prices["close"])
+            return ExitResult(replace(current, peak_adjusted_close=peak), orders, fills, rejections)
+        base = regime_order.trigger_adjusted_price if regime_order.triggered_timestamp == timestamp else prices["open"]
+        shares = min(regime_order.remaining_shares, current.remaining_shares, available)
+        fill = _sell_fill(current, shares, "market_regime_exit", base, bar, config)
+        fills.append(fill)
+        current = replace(current, remaining_shares=current.remaining_shares - shares)
+        orders = _replace_pending(orders, regime_order, regime_order.remaining_shares - shares)
+        peak = max(current.peak_adjusted_close, prices["close"]) if current.remaining_shares else current.peak_adjusted_close
+        return ExitResult(replace(current, peak_adjusted_close=peak), orders, fills, rejections)
 
     stop_order = _pending_for(orders, "stop_loss")
     if stop_order is None and prices["low"] <= current.stop_adjusted_price:
