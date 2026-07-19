@@ -13,7 +13,7 @@ import pandas as pd
 
 from .intraday_execution import ExecutionConfig, validate_execution_config
 from .intraday_portfolio import cached_scan_candidate_provider, run_intraday_portfolio, summarize_portfolio
-from .market_regime import MarketRegimeSchedule, build_market_regime_schedule, load_market_regime_config
+from .market_regime import MarketRegimeSchedule, build_market_regime_schedule
 from .tdx_lc5 import audit_lc5_records, find_lc5_path, read_tdx_lc5_file
 
 
@@ -303,10 +303,14 @@ def _report(
 def _build_cli_market_regime(
     path: Path | None,
     minutes: dict[str, pd.DataFrame],
+    source_bytes: bytes | None = None,
 ) -> MarketRegimeSchedule | None:
     if path is None:
         return None
-    config = load_market_regime_config(path)
+    payload = json.loads((source_bytes if source_bytes is not None else path.read_bytes()).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("market regime config must be a JSON object")
+    config: dict[str, object] = payload
     trading_dates = sorted(
         {
             pd.Timestamp(date).normalize()
@@ -352,6 +356,21 @@ def main(argv: list[str] | None = None) -> int:
     scan_source = Path(args.scan_source) if args.scan_source else None
     market_regime_path = Path(args.market_regime) if args.market_regime else None
     output = Path(args.output)
+    market_regime_source = None
+    market_regime_source_bytes = None
+    market_regime_source_sha256 = None
+    if market_regime_path is not None:
+        market_regime_artifact = output / "market_regime.csv"
+        resolved_source = market_regime_path.resolve()
+        resolved_artifact = market_regime_artifact.resolve()
+        aliases_artifact = resolved_source == resolved_artifact
+        if not aliases_artifact and market_regime_artifact.exists():
+            aliases_artifact = market_regime_path.samefile(market_regime_artifact)
+        if aliases_artifact:
+            raise ValueError("market regime source must not alias output market_regime.csv")
+        market_regime_source = str(resolved_source)
+        market_regime_source_bytes = market_regime_path.read_bytes()
+        market_regime_source_sha256 = hashlib.sha256(market_regime_source_bytes).hexdigest()
     start, end = pd.Timestamp(args.analysis_start).normalize(), pd.Timestamp(args.analysis_end).normalize()
     if start > end:
         raise ValueError("analysis start must not be after end")
@@ -360,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     config["stock_pool_codes"] = codes
     daily = _load_qfq(qfq_source, set(codes), start, end)
     minutes, data_audit, minute_paths = _load_minutes(minute_root, codes, daily, start, end)
-    market_regime = _build_cli_market_regime(market_regime_path, minutes)
+    market_regime = _build_cli_market_regime(market_regime_path, minutes, market_regime_source_bytes)
     execution = _execution_config(config)
     cached_scans = None
     candidate_provider = None
@@ -385,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
     portfolio_summary, trade_summary = summarize_portfolio(result, execution.initial_cash)
     comparison = portfolio_summary.assign(mode="intraday_portfolio", start=start, end=end)
     output.mkdir(parents=True, exist_ok=True)
+    if market_regime is None:
+        (output / "market_regime.csv").unlink(missing_ok=True)
     frames = {
         "data_audit.csv": result.data_audit,
         "signal_scans.csv": result.scans,
@@ -433,8 +454,8 @@ def main(argv: list[str] | None = None) -> int:
     if market_regime_path is not None:
         manifest.update(
             {
-                "market_regime_source": str(market_regime_path.resolve()),
-                "market_regime_source_sha256": _sha256_file(market_regime_path),
+                "market_regime_source": market_regime_source,
+                "market_regime_source_sha256": market_regime_source_sha256,
                 "outputs": [*REQUIRED_OUTPUTS, "market_regime.csv"],
             }
         )

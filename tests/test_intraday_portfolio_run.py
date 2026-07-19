@@ -1,11 +1,13 @@
-import json
 import hashlib
+import json
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
+import a_share_backtesting.intraday_portfolio_run as cli_module
 
 from a_share_backtesting.intraday_portfolio_run import (
     REQUIRED_OUTPUTS,
@@ -245,6 +247,30 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         self.assertAlmostEqual(summary.loc[0, "initial_cash"], 1_000_000.0)
         self.assertAlmostEqual(summary.loc[0, "final_nav"], 1_000_000.0)
         manifest = json.loads((self.output / "run_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(manifest),
+            {
+                "mode",
+                "analysis_start",
+                "analysis_end",
+                "stock_pool_count",
+                "processed_code_count",
+                "minute_file_count",
+                "qfq_source",
+                "qfq_source_sha256",
+                "stock_pool_sha256",
+                "config_sha256",
+                "scan_source",
+                "scan_source_sha256",
+                "minute_source_sha256",
+                "last_minute_date",
+                "git_revision",
+                "git_dirty",
+                "python_version",
+                "execution_config",
+                "limitations",
+            },
+        )
         self.assertEqual(manifest["stock_pool_count"], 1)
         self.assertEqual(manifest["minute_file_count"], 1)
         self.assertEqual(len(manifest["qfq_source_sha256"]), 64)
@@ -257,9 +283,175 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         self.assertNotIn("market_regime_source_sha256", manifest)
         self.assertNotIn("outputs", manifest)
         report = (self.output / "report.md").read_text(encoding="utf-8")
-        self.assertNotIn("Market-regime dates were manually supplied.", report)
-        self.assertNotIn("Market-regime thresholds are post-hoc.", report)
-        self.assertNotIn("same_day_1455", report)
+        self.assertEqual(
+            report,
+            "# Intraday B1 Portfolio Backtest\n"
+            "\n"
+            "- Total net return: 0.0000%\n"
+            "- Five-minute maximum drawdown: 0.0000%\n"
+            "- Conservative low maximum drawdown: 0.0000%\n"
+            "- Closed trades: 0\n"
+            "- Net win rate: nan%\n"
+            "- Data audit issues: 0\n"
+            "\n"
+            "## Limitations\n"
+            "\n"
+            "- retrospective_stock_pool_snapshot\n"
+            "- historical_st_status_unavailable\n"
+            "- historical_market_cap_unavailable\n"
+            "- five_minute_intrabar_order_unknown_stop_first\n"
+            "- order_book_queue_unavailable\n",
+        )
+
+    def test_untimed_rerun_removes_only_stale_market_regime_artifact(self) -> None:
+        self.write_inputs()
+        regime_path = self.root / "market_regime.json"
+        regime_path.write_text(
+            json.dumps(
+                {
+                    "observation_start": "2026-07-17",
+                    "initial_state": "risk_on",
+                    "execution_mode": "same_day_1455",
+                    "events": [
+                        {"signal_date": "2026-07-17", "event": "down", "label": "risk_off"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        common_args = [
+            "--minute-root",
+            str(self.minute_root),
+            "--qfq-source",
+            str(self.qfq_path),
+            "--stock-pool",
+            str(self.pool_path),
+            "--config",
+            str(self.config_path),
+            "--output",
+            str(self.output),
+            "--analysis-start",
+            "2026-07-17",
+            "--analysis-end",
+            "2026-07-17",
+        ]
+
+        self.assertEqual(main([*common_args, "--market-regime", str(regime_path)]), 0)
+        self.assertTrue((self.output / "market_regime.csv").exists())
+        sentinel = self.output / "preserve.me"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        self.assertEqual(main(common_args), 0)
+
+        self.assertFalse((self.output / "market_regime.csv").exists())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertTrue(set(REQUIRED_OUTPUTS).issubset({path.name for path in self.output.iterdir()}))
+
+    def test_market_regime_manifest_hash_uses_the_parsed_source_snapshot(self) -> None:
+        self.write_inputs()
+        regime_path = self.root / "market_regime.json"
+        original_payload = {
+            "observation_start": "2026-07-17",
+            "initial_state": "risk_on",
+            "execution_mode": "same_day_1455",
+            "events": [
+                {"signal_date": "2026-07-17", "event": "down", "label": "frozen_snapshot"}
+            ],
+        }
+        original_bytes = json.dumps(original_payload, indent=2).encode("utf-8")
+        regime_path.write_bytes(original_bytes)
+        mutated_bytes = json.dumps(
+            {
+                **original_payload,
+                "events": [
+                    {"signal_date": "2026-07-17", "event": "down", "label": "mutated_source"}
+                ],
+            },
+            indent=2,
+        ).encode("utf-8")
+        original_write_csv = cli_module._write_csv
+        source_mutated = False
+
+        def mutate_source_then_write(frame: pd.DataFrame, path: Path) -> None:
+            nonlocal source_mutated
+            if not source_mutated:
+                regime_path.write_bytes(mutated_bytes)
+                source_mutated = True
+            original_write_csv(frame, path)
+
+        with patch.object(cli_module, "_write_csv", side_effect=mutate_source_then_write):
+            exit_code = main(
+                [
+                    "--minute-root",
+                    str(self.minute_root),
+                    "--qfq-source",
+                    str(self.qfq_path),
+                    "--stock-pool",
+                    str(self.pool_path),
+                    "--config",
+                    str(self.config_path),
+                    "--market-regime",
+                    str(regime_path),
+                    "--output",
+                    str(self.output),
+                    "--analysis-start",
+                    "2026-07-17",
+                    "--analysis-end",
+                    "2026-07-17",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(pd.read_csv(self.output / "market_regime.csv").loc[0, "label"], "frozen_snapshot")
+        manifest = json.loads((self.output / "run_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["market_regime_source_sha256"],
+            hashlib.sha256(original_bytes).hexdigest(),
+        )
+        self.assertNotEqual(
+            manifest["market_regime_source_sha256"],
+            hashlib.sha256(regime_path.read_bytes()).hexdigest(),
+        )
+
+    def test_market_regime_source_cannot_alias_generated_timeline(self) -> None:
+        self.write_inputs()
+        self.output.mkdir(parents=True)
+        regime_path = self.output / "market_regime.csv"
+        source_bytes = json.dumps(
+            {
+                "observation_start": "2026-07-17",
+                "initial_state": "risk_on",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": "2026-07-17", "event": "down", "label": "risk_off"}
+                ],
+            }
+        ).encode("utf-8")
+        regime_path.write_bytes(source_bytes)
+
+        with self.assertRaisesRegex(ValueError, "must not alias output market_regime.csv"):
+            main(
+                [
+                    "--minute-root",
+                    str(self.minute_root),
+                    "--qfq-source",
+                    str(self.qfq_path),
+                    "--stock-pool",
+                    str(self.pool_path),
+                    "--config",
+                    str(self.config_path),
+                    "--market-regime",
+                    str(regime_path),
+                    "--output",
+                    str(self.output),
+                    "--analysis-start",
+                    "2026-07-17",
+                    "--analysis-end",
+                    "2026-07-17",
+                ]
+            )
+
+        self.assertEqual(regime_path.read_bytes(), source_bytes)
 
     def test_cli_writes_conditional_market_regime_artifact_and_provenance(self) -> None:
         self.write_inputs(("2026-07-16", "2026-07-17"))
