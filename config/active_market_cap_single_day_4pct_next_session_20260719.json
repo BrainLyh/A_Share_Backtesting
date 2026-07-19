@@ -1,0 +1,16 @@
+{
+  "timing_definition": "single_day_4pct",
+  "observation_start": "2026-06-01",
+  "initial_state": "risk_off",
+  "execution_mode": "next_session_0935",
+  "events": [
+    {"signal_date": "2026-06-08", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
+    {"signal_date": "2026-06-15", "event": "up", "label": "single_day_0amv_rise_at_least_4pct"},
+    {"signal_date": "2026-07-02", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
+    {"signal_date": "2026-07-07", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
+    {"signal_date": "2026-07-08", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
+    {"signal_date": "2026-07-13", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
+    {"signal_date": "2026-07-16", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
+    {"signal_date": "2026-07-17", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"}
+  ]
+}
