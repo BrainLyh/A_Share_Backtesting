@@ -112,6 +112,8 @@ def build_market_regime_schedule(
     config: Mapping[str, object],
     trading_dates: Sequence[object],
 ) -> MarketRegimeSchedule:
+    if not isinstance(config, Mapping):
+        raise ValueError("market regime config must be an object")
     initial_state = config.get("initial_state")
     if initial_state not in {RISK_OFF, RISK_ON}:
         raise ValueError("initial_state must be 'risk_off' or 'risk_on'")
@@ -132,6 +134,8 @@ def build_market_regime_schedule(
         signal_date = _iso_date(raw_event.get("signal_date"), "event signal_date")
         if signal_date < observation_start:
             raise ValueError("event signal_date must not precede observation_start")
+        if signal_date not in dates:
+            raise ValueError(f"signal date {signal_date:%Y-%m-%d} is not a supplied trading date")
         if signal_date in observed_dates:
             raise ValueError(f"duplicate or conflicting event observation on {signal_date:%Y-%m-%d}")
         observed_dates.add(signal_date)
@@ -145,12 +149,17 @@ def build_market_regime_schedule(
 
     state = initial_state
     transitions: list[RegimeTransition] = []
+    effective_timestamps: set[pd.Timestamp] = set()
     for signal_date, event, label in sorted(observations, key=lambda item: item[0]):
         resulting_state = RISK_ON if event == "up" else RISK_OFF
+        effective_timestamp = _effective_timestamp(signal_date, mode, dates)
+        if effective_timestamp in effective_timestamps:
+            raise ValueError(f"multiple events resolve to {effective_timestamp:%Y-%m-%d %H:%M}")
+        effective_timestamps.add(effective_timestamp)
         transitions.append(
             RegimeTransition(
                 signal_date=signal_date,
-                effective_timestamp=_effective_timestamp(signal_date, mode, dates),
+                effective_timestamp=effective_timestamp,
                 event=event,
                 label=label,
                 prior_state=state,

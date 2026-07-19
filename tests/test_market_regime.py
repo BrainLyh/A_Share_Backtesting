@@ -127,6 +127,25 @@ class NextSessionMarketRegimeScheduleTests(unittest.TestCase):
             build_market_regime_schedule(config, TRADING_DATES)
 
 
+class MarketRegimeValidationTests(unittest.TestCase):
+    def test_next_session_rejects_non_trading_observations_that_share_an_effective_timestamp(self) -> None:
+        config = {
+            **same_day_config(),
+            "execution_mode": "next_session_0935",
+            "events": [
+                {"signal_date": "2026-06-19", "event": "up", "label": "first_non_trading_observation"},
+                {"signal_date": "2026-06-20", "event": "down", "label": "second_non_trading_observation"},
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "not a supplied trading date"):
+            build_market_regime_schedule(config, TRADING_DATES)
+
+    def test_non_mapping_config_has_an_explicit_validation_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "market regime config must be an object"):
+            build_market_regime_schedule(None, TRADING_DATES)  # type: ignore[arg-type]
+
+
 class DatedMarketRegimeConfigTests(unittest.TestCase):
     def test_dated_configs_load_with_deterministic_effective_timestamps(self) -> None:
         root = Path(__file__).resolve().parents[1]
