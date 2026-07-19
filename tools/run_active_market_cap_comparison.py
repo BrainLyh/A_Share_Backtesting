@@ -11,7 +11,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from a_share_backtesting.intraday_portfolio_run import main as intraday_cli_main
+from a_share_backtesting.intraday_portfolio_run import (
+    EMPTY_CSV_COLUMNS,
+    REQUIRED_OUTPUTS as CLI_REQUIRED_OUTPUTS,
+    main as intraday_cli_main,
+)
 from a_share_backtesting.market_regime import (
     MarketRegimeSchedule,
     build_market_regime_schedule,
@@ -35,6 +39,7 @@ class PoolSources:
 @dataclass(frozen=True)
 class PositionSources:
     config: str
+    target_fraction: float
 
 
 @dataclass(frozen=True)
@@ -94,9 +99,13 @@ POOL_SOURCES: dict[str, PoolSources] = {
 }
 
 POSITION_CONFIGS: dict[str, PositionSources] = {
-    "canonical": PositionSources(config="config/intraday_portfolio_20260718.json"),
+    "canonical": PositionSources(
+        config="config/intraday_portfolio_20260718.json",
+        target_fraction=1.0 / 3.0,
+    ),
     "risk025": PositionSources(
-        config="config/intraday_portfolio_risk_controlled_20260718.json"
+        config="config/intraday_portfolio_risk_controlled_20260718.json",
+        target_fraction=0.25,
     ),
 }
 
@@ -148,23 +157,7 @@ BASELINE_SOURCES: dict[tuple[str, str], str] = {
     ),
 }
 
-REQUIRED_OUTPUTS = (
-    "data_audit.csv",
-    "signal_scans.csv",
-    "candidates.csv",
-    "orders.csv",
-    "fills.csv",
-    "positions.csv",
-    "trades.csv",
-    "rejections.csv",
-    "nav_5m.csv",
-    "nav_daily.csv",
-    "portfolio_summary.csv",
-    "trade_summary.csv",
-    "comparison.csv",
-    "run_manifest.json",
-    "report.md",
-)
+REQUIRED_OUTPUTS = CLI_REQUIRED_OUTPUTS
 
 _PORTFOLIO_SUMMARY_COLUMNS = [
     "initial_cash",
@@ -184,97 +177,7 @@ _PORTFOLIO_SUMMARY_COLUMNS = [
 ]
 CSV_SCHEMAS: dict[str, list[str]] = {
     "data_audit.csv": ["code", "date", "reason"],
-    "signal_scans.csv": [
-        "date",
-        "code",
-        "scan_time",
-        "b1_signal",
-        "eligible",
-        "signal_strength",
-        "j",
-        "prior_j",
-        "bbi",
-        "dif",
-        "volume",
-        "volume_ma",
-        "atr14",
-        "qfq_scale",
-    ],
-    "candidates.csv": [
-        "date",
-        "code",
-        "scan_time",
-        "b1_signal",
-        "eligible",
-        "signal_strength",
-        "j",
-        "prior_j",
-        "bbi",
-        "dif",
-        "volume",
-        "volume_ma",
-        "atr14",
-        "qfq_scale",
-        "first_trigger_time",
-    ],
-    "orders.csv": ["timestamp", "code", "side", "reason", "status"],
-    "fills.csv": [
-        "position_id",
-        "code",
-        "timestamp",
-        "side",
-        "reason",
-        "shares",
-        "raw_price",
-        "adjusted_price",
-        "gross_notional",
-        "commission",
-        "stamp_duty",
-        "slippage_cost",
-        "cash_delta",
-    ],
-    "positions.csv": [
-        "timestamp",
-        "position_id",
-        "code",
-        "remaining_shares",
-        "market_value",
-        "position_return",
-        "position_return_low",
-    ],
-    "trades.csv": [
-        "position_id",
-        "code",
-        "entry_timestamp",
-        "exit_timestamp",
-        "status",
-        "exit_reason",
-        "entry_cost",
-        "net_proceeds",
-        "net_pnl",
-        "net_return",
-        "holding_days",
-        "maximum_adverse_excursion",
-    ],
-    "rejections.csv": ["timestamp", "code", "side", "reason"],
-    "nav_5m.csv": [
-        "timestamp",
-        "date",
-        "cash",
-        "gross_exposure",
-        "positions",
-        "nav",
-        "nav_low",
-    ],
-    "nav_daily.csv": [
-        "timestamp",
-        "date",
-        "cash",
-        "gross_exposure",
-        "positions",
-        "nav",
-        "nav_low",
-    ],
+    **{name: list(columns) for name, columns in EMPTY_CSV_COLUMNS.items()},
     "portfolio_summary.csv": _PORTFOLIO_SUMMARY_COLUMNS,
     "trade_summary.csv": [
         "closed_trade_count",
@@ -458,6 +361,7 @@ def frozen_source_paths(jobs: Sequence[MatrixRun]) -> tuple[str, ...]:
                 job.config,
                 job.single_day_config,
                 job.two_day_config,
+                f"{job.baseline}/nav_daily.csv",
                 f"{job.baseline}/run_manifest.json",
             }
         )
@@ -490,6 +394,7 @@ def serialize_run_source_manifest(
         "runs": [
             {
                 "baseline": job.baseline,
+                "baseline_calendar": f"{job.baseline}/nav_daily.csv",
                 "config": job.config,
                 "market_regime": job.single_day_config,
                 "pool": job.pool,
@@ -543,7 +448,76 @@ def _timestamps(frame: pd.DataFrame, columns: Sequence[str], artifact: str) -> p
     return converted
 
 
-def parse_run_artifacts(run_dir: Path) -> dict[str, pd.DataFrame]:
+def _runner_file_source_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(path.resolve()).encode("utf-8"))
+    digest.update(bytes.fromhex(_sha256_file(path)))
+    return digest.hexdigest()
+
+
+def _require_manifest_value(
+    manifest: Mapping[str, object], field: str, expected: object
+) -> None:
+    if manifest.get(field) != expected:
+        raise ReconciliationError(
+            f"run_manifest.json manifest mismatch for {field}: "
+            f"{manifest.get(field)!r} != {expected!r}"
+        )
+
+
+def _validate_run_manifest(
+    manifest: object,
+    job: MatrixRun,
+    repo_root: Path,
+) -> None:
+    if not isinstance(manifest, Mapping):
+        raise ReconciliationError("run_manifest.json schema drift")
+    qfq = repo_root / job.qfq_source
+    pool = repo_root / job.stock_pool
+    config = repo_root / job.config
+    scan = repo_root / job.scan_source
+    regime = repo_root / job.single_day_config
+    expected = {
+        "mode": "intraday-b1-portfolio",
+        "analysis_start": ANALYSIS_START,
+        "analysis_end": ANALYSIS_END,
+        "qfq_source": str(qfq.resolve()),
+        "qfq_source_sha256": _runner_file_source_sha256(qfq),
+        "stock_pool_sha256": _sha256_file(pool),
+        "config_sha256": _sha256_file(config),
+        "scan_source": str(scan.resolve()),
+        "scan_source_sha256": _sha256_file(scan),
+        "market_regime_source": str(regime.resolve()),
+        "market_regime_source_sha256": _sha256_file(regime),
+        "outputs": [*REQUIRED_OUTPUTS, "market_regime.csv"],
+    }
+    for field, value in expected.items():
+        _require_manifest_value(manifest, field, value)
+
+    execution_config = manifest.get("execution_config")
+    target = execution_config.get("target_fraction") if isinstance(execution_config, Mapping) else None
+    expected_target = POSITION_CONFIGS[job.position].target_fraction
+    try:
+        matches_target = math.isclose(
+            float(target), expected_target, rel_tol=1e-12, abs_tol=1e-12
+        )
+    except (TypeError, ValueError):
+        matches_target = False
+    if not matches_target:
+        raise ReconciliationError(
+            "run_manifest.json target fraction mismatch: "
+            f"{target!r} != {expected_target!r}"
+        )
+    regime_config = load_market_regime_config(regime)
+    if regime_config.get("execution_mode") != job.timing:
+        raise ReconciliationError("market-regime source mode does not match matrix job")
+
+
+def parse_run_artifacts(
+    run_dir: Path,
+    job: MatrixRun,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, pd.DataFrame]:
     frames: dict[str, pd.DataFrame] = {}
     for filename, expected_columns in CSV_SCHEMAS.items():
         path = run_dir / filename
@@ -559,23 +533,28 @@ def parse_run_artifacts(run_dir: Path) -> dict[str, pd.DataFrame]:
             )
         frames[filename] = frame
 
+    for filename in (
+        "market_regime.csv",
+        "nav_5m.csv",
+        "nav_daily.csv",
+        "portfolio_summary.csv",
+        "trade_summary.csv",
+        "comparison.csv",
+    ):
+        if frames[filename].empty:
+            raise ReconciliationError(f"{filename} must not be empty")
+    timeline_modes = set(frames["market_regime.csv"]["execution_mode"].astype(str))
+    if timeline_modes != {job.timing}:
+        raise ReconciliationError(
+            f"market_regime.csv timeline mode mismatch: {timeline_modes!r} != {job.timing!r}"
+        )
+
     manifest_path = run_dir / "run_manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as error:
         raise ReconciliationError(f"cannot parse run_manifest.json: {error}") from error
-    required_manifest = {
-        "mode",
-        "analysis_start",
-        "analysis_end",
-        "market_regime_source",
-        "market_regime_source_sha256",
-        "outputs",
-    }
-    if not isinstance(manifest, dict) or not required_manifest.issubset(manifest):
-        raise ReconciliationError("run_manifest.json schema drift")
-    if manifest["outputs"] != [*REQUIRED_OUTPUTS, "market_regime.csv"]:
-        raise ReconciliationError("run_manifest.json outputs schema drift")
+    _validate_run_manifest(manifest, job, repo_root)
     try:
         (run_dir / "report.md").read_text(encoding="utf-8")
     except Exception as error:
@@ -624,8 +603,27 @@ def _normalized_fills(frames: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
 
 def reconcile_share_balances(frames: Mapping[str, pd.DataFrame]) -> None:
     fills = _normalized_fills(frames)
-    if fills.empty:
-        return
+    nav = _timestamps(frames["nav_5m.csv"], ["timestamp"], "nav_5m.csv")
+    final_timestamp = nav["timestamp"].max()
+    positions = _timestamps(frames["positions.csv"], ["timestamp"], "positions.csv")
+    positions = _numeric(positions, ["remaining_shares"], "positions.csv")
+    if positions.duplicated(["timestamp", "position_id"]).any():
+        raise ReconciliationError("duplicate position snapshot")
+    final_positions = positions.loc[positions["timestamp"].eq(final_timestamp)]
+    remainder = final_positions.set_index("position_id")["remaining_shares"].to_dict()
+
+    trades = _timestamps(
+        frames["trades.csv"], ["entry_timestamp", "exit_timestamp"], "trades.csv"
+    )
+    if trades["position_id"].duplicated().any():
+        raise ReconciliationError("trades.csv has duplicate position_id")
+    trade_status = trades.set_index("position_id")["status"].to_dict()
+    fill_ids = set(fills["position_id"].astype(str))
+    if set(trade_status) != fill_ids:
+        raise ReconciliationError("fills and trades position IDs do not reconcile")
+    if set(remainder) - fill_ids:
+        raise ReconciliationError("final positions contain unknown position IDs")
+
     for position_id, group in fills.groupby("position_id", sort=True):
         bought = float(group.loc[group["side"].eq("buy"), "shares"].sum())
         sold = float(group.loc[group["side"].eq("sell"), "shares"].sum())
@@ -637,6 +635,28 @@ def reconcile_share_balances(frames: Mapping[str, pd.DataFrame]) -> None:
             )
         if group["code"].astype(str).str.zfill(6).nunique() != 1:
             raise ReconciliationError(f"position {position_id} changes code")
+        final_remainder = float(remainder.get(position_id, 0.0))
+        status = trade_status[position_id]
+        if status == "closed" and final_remainder != 0.0:
+            raise ReconciliationError(
+                f"position {position_id}: closed trade has final remainder"
+            )
+        if status == "open" and final_remainder <= 0.0:
+            raise ReconciliationError(
+                f"position {position_id}: open trade has no final remainder"
+            )
+        if status not in {"open", "closed"}:
+            raise ReconciliationError(f"position {position_id}: invalid trade status {status}")
+        if not math.isclose(
+            bought,
+            sold + final_remainder,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ReconciliationError(
+                f"position {position_id}: share balance does not reconcile "
+                f"({bought} != {sold} + {final_remainder})"
+            )
 
 
 def reconcile_position_constraints(frames: Mapping[str, pd.DataFrame]) -> None:
@@ -690,22 +710,57 @@ def _validated_regime_timeline(frames: Mapping[str, pd.DataFrame]) -> pd.DataFra
     return timeline
 
 
-def reconcile_risk_off_entries(frames: Mapping[str, pd.DataFrame]) -> None:
+def reconcile_regime_liquidation_intent(frames: Mapping[str, pd.DataFrame]) -> None:
     fills = _normalized_fills(frames)
-    buys = fills.loc[fills["side"].eq("buy")]
-    if buys.empty:
-        return
     timeline = _validated_regime_timeline(frames)
-    if timeline.empty:
+    if timeline.empty and not fills.loc[fills["side"].eq("buy")].empty:
         raise ReconciliationError("market regime timeline is empty with entry fills")
-    initial_state = str(timeline.iloc[0]["prior_state"])
-    for fill in buys.itertuples(index=False):
-        prior = timeline.loc[timeline["effective_timestamp"] <= fill.timestamp]
-        state = initial_state if prior.empty else str(prior.iloc[-1]["resulting_state"])
-        if state == "risk_off":
-            raise ReconciliationError(
-                f"entry fill in risk_off: {fill.position_id} at {fill.timestamp}"
-            )
+    if timeline.empty:
+        return
+
+    state = str(timeline.iloc[0]["prior_state"])
+    balances: dict[str, float] = {}
+    targeted: set[str] = set()
+    fills = fills.assign(_row_order=np.arange(len(fills)))
+    timestamps = sorted(
+        set(timeline["effective_timestamp"]).union(set(fills["timestamp"]))
+    )
+    for timestamp in timestamps:
+        transitions = timeline.loc[timeline["effective_timestamp"].eq(timestamp)]
+        for transition in transitions.itertuples(index=False):
+            state = str(transition.resulting_state)
+            if transition.event == "down":
+                targeted.update(
+                    position_id
+                    for position_id, shares in balances.items()
+                    if shares > 0.0
+                )
+
+        timestamp_fills = fills.loc[fills["timestamp"].eq(timestamp)].sort_values(
+            "_row_order"
+        )
+        for fill in timestamp_fills.itertuples(index=False):
+            position_id = str(fill.position_id)
+            shares = float(fill.shares)
+            if fill.side == "buy":
+                pending = sorted(
+                    targeted_id
+                    for targeted_id in targeted
+                    if balances.get(targeted_id, 0.0) > 0.0
+                )
+                if pending:
+                    raise ReconciliationError(
+                        f"entry while regime liquidation remains: {pending}"
+                    )
+                if state == "risk_off":
+                    raise ReconciliationError(
+                        f"entry fill in risk_off: {position_id} at {timestamp}"
+                    )
+                balances[position_id] = balances.get(position_id, 0.0) + shares
+            else:
+                balances[position_id] = balances.get(position_id, 0.0) - shares
+                if balances[position_id] <= 0.0:
+                    targeted.discard(position_id)
 
 
 def reconcile_regime_exits(frames: Mapping[str, pd.DataFrame]) -> None:
@@ -766,12 +821,16 @@ def reconcile_frames(frames: Mapping[str, pd.DataFrame]) -> None:
     reconcile_nav(frames)
     reconcile_share_balances(frames)
     reconcile_position_constraints(frames)
-    reconcile_risk_off_entries(frames)
+    reconcile_regime_liquidation_intent(frames)
     reconcile_regime_exits(frames)
 
 
-def reconcile_run_artifacts(run_dir: Path) -> None:
-    reconcile_frames(parse_run_artifacts(run_dir))
+def reconcile_run_artifacts(
+    run_dir: Path,
+    job: MatrixRun,
+    repo_root: Path = REPO_ROOT,
+) -> None:
+    reconcile_frames(parse_run_artifacts(run_dir, job, repo_root))
 
 
 def run_matrix(
@@ -794,7 +853,7 @@ def run_matrix(
         exit_code = cli_main(argv)
         if exit_code != 0:
             raise RuntimeError(f"{job.run_key}: intraday CLI returned exit code {exit_code}")
-        reconcile_run_artifacts(output_root / job.run_key)
+        reconcile_run_artifacts(output_root / job.run_key, job, repo_root)
     return len(jobs)
 
 

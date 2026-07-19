@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -69,6 +70,10 @@ class MatrixDefinitionTests(unittest.TestCase):
                 "canonical": "config/intraday_portfolio_20260718.json",
                 "risk025": "config/intraday_portfolio_risk_controlled_20260718.json",
             },
+        )
+        self.assertEqual(
+            {key: value.target_fraction for key, value in driver.POSITION_CONFIGS.items()},
+            {"canonical": 1.0 / 3.0, "risk025": 0.25},
         )
         self.assertEqual(
             driver.BASELINE_SOURCES,
@@ -223,6 +228,16 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(len(payload["runs"]), 16)
         self.assertEqual(list(payload["source_sha256"]), sorted(paths))
         self.assertTrue(all(not Path(path).is_absolute() for path in payload["source_sha256"]))
+        self.assertIn(
+            "outputs/intraday_b1_final_verified_20260718/"
+            "ai_canonical_20260717/nav_daily.csv",
+            payload["source_sha256"],
+        )
+        self.assertEqual(
+            payload["runs"][0]["baseline_calendar"],
+            "outputs/intraday_b1_final_verified_20260718/"
+            "ai_canonical_20260717/nav_daily.csv",
+        )
         self.assertNotIn("generated_at", payload)
 
 
@@ -230,7 +245,7 @@ def _empty(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
-def valid_frames() -> dict[str, pd.DataFrame]:
+def valid_frames(execution_mode: str = "same_day_1455") -> dict[str, pd.DataFrame]:
     schemas = driver.CSV_SCHEMAS
     frames = {name: _empty(columns) for name, columns in schemas.items()}
     frames["fills.csv"] = pd.DataFrame(
@@ -333,6 +348,30 @@ def valid_frames() -> dict[str, pd.DataFrame]:
     frames["comparison.csv"] = frames["portfolio_summary.csv"].assign(
         mode="intraday_portfolio", start="2026-06-01", end="2026-06-03"
     )
+    frames["trade_summary.csv"] = pd.DataFrame(
+        [
+            {
+                "closed_trade_count": 0,
+                "open_trade_count": 1,
+                "win_rate": float("nan"),
+                "mean_net_return": float("nan"),
+                "median_net_return": float("nan"),
+                "profit_factor": float("nan"),
+                "payoff_ratio": float("nan"),
+                "expectancy": float("nan"),
+                "average_holding_days": float("nan"),
+                "maximum_consecutive_losses": 0,
+                "take_profit_trade_rate": float("nan"),
+                "stop_exit_rate": float("nan"),
+                "residual_exit_rate": float("nan"),
+                "expiry_exit_rate": float("nan"),
+                "overtime_exit_rate": float("nan"),
+                "mean_maximum_adverse_excursion": float("nan"),
+                "worst_maximum_adverse_excursion": float("nan"),
+            }
+        ],
+        columns=schemas["trade_summary.csv"],
+    )
     frames["market_regime.csv"] = pd.DataFrame(
         [
             {
@@ -342,7 +381,7 @@ def valid_frames() -> dict[str, pd.DataFrame]:
                 "label": "closed",
                 "prior_state": "risk_off",
                 "resulting_state": "risk_off",
-                "execution_mode": "same_day_1455",
+                "execution_mode": execution_mode,
             },
             {
                 "signal_date": "2026-06-02",
@@ -351,7 +390,7 @@ def valid_frames() -> dict[str, pd.DataFrame]:
                 "label": "open",
                 "prior_state": "risk_off",
                 "resulting_state": "risk_on",
-                "execution_mode": "same_day_1455",
+                "execution_mode": execution_mode,
             },
             {
                 "signal_date": "2026-06-03",
@@ -360,12 +399,103 @@ def valid_frames() -> dict[str, pd.DataFrame]:
                 "label": "close",
                 "prior_state": "risk_on",
                 "resulting_state": "risk_off",
-                "execution_mode": "same_day_1455",
+                "execution_mode": execution_mode,
             },
         ],
         columns=schemas["market_regime.csv"],
     )
     return frames
+
+
+def _write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _runner_file_source_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(path.resolve()).encode("utf-8"))
+    digest.update(bytes.fromhex(_file_sha256(path)))
+    return digest.hexdigest()
+
+
+def prepare_frozen_repo(root: Path) -> None:
+    jobs = driver.build_matrix()
+    for relative in driver.frozen_source_paths(jobs):
+        _write(root / relative, "synthetic-source\n")
+
+    for position, sources in driver.POSITION_CONFIGS.items():
+        _write(
+            root / sources.config,
+            json.dumps(
+                {
+                    "target_fraction": 1.0 / 3.0 if position == "canonical" else 0.25,
+                }
+            ),
+        )
+
+    events = [
+        {"signal_date": "2026-06-01", "event": "down", "label": "closed"},
+        {"signal_date": "2026-06-02", "event": "up", "label": "open"},
+        {"signal_date": "2026-06-03", "event": "down", "label": "closed_again"},
+    ]
+    for timing, sources in driver.TIMING_CONFIGS.items():
+        payload = {
+            "observation_start": "2026-06-01",
+            "initial_state": "risk_off",
+            "execution_mode": timing,
+            "events": events,
+        }
+        _write(root / sources.single_day_config, json.dumps(payload))
+        _write(root / sources.two_day_config, json.dumps(payload))
+
+    calendar = pd.DataFrame(
+        {"date": pd.bdate_range("2026-06-01", "2026-07-20").strftime("%Y-%m-%d")}
+    ).to_csv(index=False)
+    for baseline in driver.BASELINE_SOURCES.values():
+        _write(root / baseline / "nav_daily.csv", calendar)
+        _write(root / baseline / "run_manifest.json", "{}\n")
+
+
+def valid_manifest(job: driver.MatrixRun, repo_root: Path) -> dict[str, object]:
+    qfq = repo_root / job.qfq_source
+    pool = repo_root / job.stock_pool
+    config = repo_root / job.config
+    scan = repo_root / job.scan_source
+    regime = repo_root / job.single_day_config
+    return {
+        "mode": "intraday-b1-portfolio",
+        "analysis_start": driver.ANALYSIS_START,
+        "analysis_end": driver.ANALYSIS_END,
+        "qfq_source": str(qfq.resolve()),
+        "qfq_source_sha256": _runner_file_source_sha256(qfq),
+        "stock_pool_sha256": _file_sha256(pool),
+        "config_sha256": _file_sha256(config),
+        "scan_source": str(scan.resolve()),
+        "scan_source_sha256": _file_sha256(scan),
+        "execution_config": {
+            "target_fraction": driver.POSITION_CONFIGS[job.position].target_fraction,
+        },
+        "market_regime_source": str(regime.resolve()),
+        "market_regime_source_sha256": _file_sha256(regime),
+        "outputs": [*driver.REQUIRED_OUTPUTS, "market_regime.csv"],
+    }
+
+
+def write_run_artifacts(
+    run_dir: Path,
+    frames: dict[str, pd.DataFrame],
+    manifest: dict[str, object],
+) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for name, frame in frames.items():
+        frame.to_csv(run_dir / name, index=False)
+    (run_dir / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (run_dir / "report.md").write_text("synthetic\n", encoding="utf-8")
 
 
 class ArtifactReconciliationTests(unittest.TestCase):
@@ -386,6 +516,23 @@ class ArtifactReconciliationTests(unittest.TestCase):
         frames["fills.csv"].loc[1, "shares"] = 101
 
         with self.assertRaisesRegex(driver.ReconciliationError, "sold shares exceed bought"):
+            driver.reconcile_share_balances(frames)
+
+    def test_every_open_position_requires_exact_final_remainder_without_regime_fill(self) -> None:
+        frames = valid_frames()
+        frames["fills.csv"].loc[1, "reason"] = "take_profit_1"
+        frames["positions.csv"].loc[1, "remaining_shares"] = 39
+
+        with self.assertRaisesRegex(driver.ReconciliationError, "share balance does not reconcile"):
+            driver.reconcile_share_balances(frames)
+
+    def test_closed_trade_must_have_zero_final_remainder(self) -> None:
+        frames = valid_frames()
+        frames["fills.csv"].loc[1, "shares"] = 100
+        frames["trades.csv"].loc[0, "status"] = "closed"
+        frames["trades.csv"].loc[0, "exit_timestamp"] = "2026-06-03 14:55:00"
+
+        with self.assertRaisesRegex(driver.ReconciliationError, "closed trade has final remainder"):
             driver.reconcile_share_balances(frames)
 
     def test_same_code_positions_cannot_overlap(self) -> None:
@@ -411,7 +558,84 @@ class ArtifactReconciliationTests(unittest.TestCase):
         frames["fills.csv"].loc[0, "timestamp"] = "2026-06-01 14:55:00"
 
         with self.assertRaisesRegex(driver.ReconciliationError, "entry fill in risk_off"):
-            driver.reconcile_risk_off_entries(frames)
+            driver.reconcile_regime_liquidation_intent(frames)
+
+    def test_entry_after_risk_on_is_forbidden_while_prior_down_target_remains(self) -> None:
+        frames = valid_frames()
+        frames["market_regime.csv"] = pd.concat(
+            [
+                frames["market_regime.csv"],
+                pd.DataFrame(
+                    [
+                        {
+                            "signal_date": "2026-06-04",
+                            "effective_timestamp": "2026-06-04 09:35:00",
+                            "event": "up",
+                            "label": "reopened",
+                            "prior_state": "risk_off",
+                            "resulting_state": "risk_on",
+                            "execution_mode": "same_day_1455",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        new_buy = frames["fills.csv"].iloc[0].copy()
+        new_buy["position_id"] = "000002:202606040935"
+        new_buy["code"] = "000002"
+        new_buy["timestamp"] = "2026-06-04 09:35:00"
+        frames["fills.csv"] = pd.concat(
+            [frames["fills.csv"], new_buy.to_frame().T], ignore_index=True
+        )
+
+        with self.assertRaisesRegex(
+            driver.ReconciliationError, "entry while regime liquidation remains"
+        ):
+            driver.reconcile_regime_liquidation_intent(frames)
+
+    def test_same_timestamp_exit_must_precede_entry_after_reopen(self) -> None:
+        frames = valid_frames()
+        frames["market_regime.csv"] = pd.concat(
+            [
+                frames["market_regime.csv"],
+                pd.DataFrame(
+                    [
+                        {
+                            "signal_date": "2026-06-04",
+                            "effective_timestamp": "2026-06-04 09:35:00",
+                            "event": "up",
+                            "label": "reopened",
+                            "prior_state": "risk_off",
+                            "resulting_state": "risk_on",
+                            "execution_mode": "same_day_1455",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        final_sell = frames["fills.csv"].iloc[1].copy()
+        final_sell["timestamp"] = "2026-06-04 09:35:00"
+        final_sell["shares"] = 40
+        new_buy = frames["fills.csv"].iloc[0].copy()
+        new_buy["position_id"] = "000002:202606040935"
+        new_buy["code"] = "000002"
+        new_buy["timestamp"] = "2026-06-04 09:35:00"
+        original = frames["fills.csv"].iloc[:2]
+        frames["fills.csv"] = pd.concat(
+            [original, final_sell.to_frame().T, new_buy.to_frame().T], ignore_index=True
+        )
+
+        driver.reconcile_regime_liquidation_intent(frames)
+
+        frames["fills.csv"] = pd.concat(
+            [original, new_buy.to_frame().T, final_sell.to_frame().T], ignore_index=True
+        )
+        with self.assertRaisesRegex(
+            driver.ReconciliationError, "entry while regime liquidation remains"
+        ):
+            driver.reconcile_regime_liquidation_intent(frames)
 
     def test_regime_exit_requires_exact_final_remainder(self) -> None:
         frames = valid_frames()
@@ -422,28 +646,135 @@ class ArtifactReconciliationTests(unittest.TestCase):
 
     def test_artifact_parser_rejects_schema_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            run_dir = Path(temporary)
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
             frames = valid_frames()
             frames["fills.csv"] = frames["fills.csv"].drop(columns="cash_delta")
-            for name, frame in frames.items():
-                frame.to_csv(run_dir / name, index=False)
-            (run_dir / "run_manifest.json").write_text(
-                json.dumps(
-                    {
-                        "mode": "intraday-b1-portfolio",
-                        "analysis_start": "2026-06-01",
-                        "analysis_end": "2026-06-03",
-                        "market_regime_source": "synthetic.json",
-                        "market_regime_source_sha256": "0" * 64,
-                        "outputs": [*driver.REQUIRED_OUTPUTS, "market_regime.csv"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (run_dir / "report.md").write_text("synthetic\n", encoding="utf-8")
+            write_run_artifacts(run_dir, frames, valid_manifest(job, repo_root))
 
             with self.assertRaisesRegex(driver.ReconciliationError, "fills.csv schema drift"):
-                driver.parse_run_artifacts(run_dir)
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
+    def test_artifact_parser_rejects_mismatched_manifest_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            manifest = valid_manifest(job, repo_root)
+            mismatch_cases = {
+                "analysis dates": ("analysis_end", "2026-07-16"),
+                "qfq path": ("qfq_source", str((repo_root / "wrong.csv").resolve())),
+                "qfq hash": ("qfq_source_sha256", "1" * 64),
+                "stock pool hash": ("stock_pool_sha256", "2" * 64),
+                "config hash": ("config_sha256", "3" * 64),
+                "scan path": ("scan_source", str((repo_root / "wrong.csv").resolve())),
+                "scan hash": ("scan_source_sha256", "4" * 64),
+                "regime path": (
+                    "market_regime_source",
+                    str((repo_root / "wrong.json").resolve()),
+                ),
+                "regime hash": ("market_regime_source_sha256", "5" * 64),
+                "outputs": ("outputs", []),
+            }
+            for label, (field, value) in mismatch_cases.items():
+                with self.subTest(label=label):
+                    bad = {**manifest, field: value}
+                    write_run_artifacts(run_dir, valid_frames(), bad)
+                    with self.assertRaisesRegex(driver.ReconciliationError, "manifest mismatch"):
+                        driver.parse_run_artifacts(run_dir, job, repo_root)
+
+            bad = {**manifest, "execution_config": {"target_fraction": 0.25}}
+            write_run_artifacts(run_dir, valid_frames(), bad)
+            with self.assertRaisesRegex(driver.ReconciliationError, "target fraction"):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
+    def test_artifact_parser_rejects_header_only_critical_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            for artifact in (
+                "market_regime.csv",
+                "nav_5m.csv",
+                "nav_daily.csv",
+                "portfolio_summary.csv",
+                "trade_summary.csv",
+                "comparison.csv",
+            ):
+                with self.subTest(artifact=artifact):
+                    frames = valid_frames()
+                    frames[artifact] = _empty(driver.CSV_SCHEMAS[artifact])
+                    write_run_artifacts(run_dir, frames, valid_manifest(job, repo_root))
+                    with self.assertRaisesRegex(driver.ReconciliationError, "must not be empty"):
+                        driver.parse_run_artifacts(run_dir, job, repo_root)
+
+    def test_artifact_parser_rejects_wrong_timeline_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            prepare_frozen_repo(repo_root)
+            job = driver.build_matrix()[0]
+            run_dir = repo_root / "run"
+            frames = valid_frames("next_session_0935")
+            write_run_artifacts(run_dir, frames, valid_manifest(job, repo_root))
+
+            with self.assertRaisesRegex(driver.ReconciliationError, "timeline mode"):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
+
+class SyntheticMatrixIntegrationTests(unittest.TestCase):
+    def test_all_sixteen_jobs_run_through_real_validation_manifest_and_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo_root = Path(temporary)
+            output_root = repo_root / "matrix"
+            prepare_frozen_repo(repo_root)
+            jobs = {job.run_key: job for job in driver.build_matrix()}
+            calls: list[str] = []
+
+            def artifact_writing_cli(argv: list[str]) -> int:
+                arguments = dict(zip(argv[::2], argv[1::2]))
+                run_dir = Path(arguments["--output"])
+                job = jobs[run_dir.name]
+                calls.append(job.run_key)
+                frames = valid_frames(job.timing)
+                frames["fills.csv"] = _empty(driver.CSV_SCHEMAS["fills.csv"])
+                frames["positions.csv"] = _empty(driver.CSV_SCHEMAS["positions.csv"])
+                frames["trades.csv"] = _empty(driver.CSV_SCHEMAS["trades.csv"])
+                frames["nav_5m.csv"].loc[:, ["cash", "nav", "nav_low"]] = 1000.0
+                frames["nav_5m.csv"].loc[:, "gross_exposure"] = 0.0
+                frames["nav_5m.csv"].loc[:, "positions"] = 0
+                frames["nav_daily.csv"] = frames["nav_5m.csv"].copy()
+                frames["portfolio_summary.csv"].loc[0, "max_positions"] = 0
+                frames["trade_summary.csv"].loc[0, "open_trade_count"] = 0
+                frames["comparison.csv"] = frames["portfolio_summary.csv"].assign(
+                    mode="intraday_portfolio",
+                    start=driver.ANALYSIS_START,
+                    end=driver.ANALYSIS_END,
+                )
+                write_run_artifacts(
+                    run_dir,
+                    frames,
+                    valid_manifest(job, repo_root),
+                )
+                return 0
+
+            completed = driver.run_matrix(
+                Path("D:/synthetic-minute-root"),
+                output_root,
+                repo_root=repo_root,
+                cli_main=artifact_writing_cli,
+            )
+
+            self.assertEqual(completed, 16)
+            self.assertEqual(calls, [job.run_key for job in driver.build_matrix()])
+            self.assertTrue((output_root / driver.RUN_SOURCE_MANIFEST).is_file())
+            self.assertEqual(
+                len([path for path in output_root.iterdir() if path.is_dir()]),
+                16,
+            )
 
 
 if __name__ == "__main__":
