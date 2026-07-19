@@ -406,6 +406,10 @@ def frozen_source_paths(jobs: Sequence[MatrixRun]) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def timed_run_manifest_paths(jobs: Sequence[MatrixRun]) -> tuple[str, ...]:
+    return tuple(sorted(f"{job.run_key}/run_manifest.json" for job in jobs))
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -418,7 +422,10 @@ def serialize_run_source_manifest(
     jobs: Sequence[MatrixRun], source_hashes: Mapping[str, str]
 ) -> str:
     expected_paths = frozen_source_paths(jobs)
-    missing = sorted(set(expected_paths) - set(source_hashes))
+    timed_manifest_paths = timed_run_manifest_paths(jobs)
+    missing = sorted(
+        (set(expected_paths) | set(timed_manifest_paths)) - set(source_hashes)
+    )
     if missing:
         raise ValueError(f"missing source hashes: {missing}")
     payload = {
@@ -447,6 +454,9 @@ def serialize_run_source_manifest(
             for job in jobs
         ],
         "source_sha256": {path: source_hashes[path] for path in expected_paths},
+        "timed_run_manifest_sha256": {
+            path: source_hashes[path] for path in timed_manifest_paths
+        },
     }
     return json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
 
@@ -460,6 +470,12 @@ def write_run_source_manifest(
         relative: _sha256_file(repo_root / relative)
         for relative in frozen_source_paths(jobs)
     }
+    hashes.update(
+        {
+            relative: _sha256_file(output_root / relative)
+            for relative in timed_run_manifest_paths(jobs)
+        }
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     path = output_root / RUN_SOURCE_MANIFEST
     path.write_text(serialize_run_source_manifest(jobs, hashes), encoding="utf-8")

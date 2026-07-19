@@ -87,6 +87,7 @@ METRIC_ARTIFACTS = (
     "trades.csv",
     "portfolio_summary.csv",
     "trade_summary.csv",
+    "run_manifest.json",
 )
 DELTA_METRICS = (
     "total_net_return",
@@ -378,6 +379,55 @@ def _validate_manifest_sources(
                 f"expected={expected_hash}, actual={actual_hash}"
             )
         verified[str(relative)] = actual_hash
+    return verified
+
+
+def _validate_timed_run_manifests(
+    manifest: Mapping[str, Any],
+    indexed: Mapping[tuple[str, str, str], Mapping[str, Any]],
+    matrix_root: Path,
+    repo_root: Path,
+) -> dict[str, str]:
+    raw_hashes = manifest.get("timed_run_manifest_sha256")
+    if not isinstance(raw_hashes, Mapping):
+        raise ValueError(
+            "full matrix source manifest timed_run_manifest_sha256 must be an object"
+        )
+    expected = {
+        f"{run['run_key']}/run_manifest.json" for run in indexed.values()
+    }
+    supplied = {str(path) for path in raw_hashes}
+    if supplied != expected:
+        missing = sorted(expected - supplied)
+        extra = sorted(supplied - expected)
+        raise ValueError(
+            "timed run manifest hash set mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    verified: dict[str, str] = {}
+    matrix_resolved = matrix_root.resolve()
+    for relative in sorted(expected):
+        supplied_path = Path(relative)
+        if supplied_path.is_absolute():
+            raise ValueError(f"timed run manifest path must be relative: {relative}")
+        path = (matrix_resolved / supplied_path).resolve()
+        try:
+            path.relative_to(matrix_resolved)
+        except ValueError as error:
+            raise ValueError(
+                f"timed run manifest path escapes matrix root: {relative}"
+            ) from error
+        if not path.is_file():
+            raise ValueError(f"missing timed run manifest: {relative}")
+        expected_hash = raw_hashes.get(relative)
+        actual_hash = _sha256_file(path)
+        if not isinstance(expected_hash, str) or actual_hash != expected_hash:
+            raise ValueError(
+                f"timed run manifest hash mismatch for {relative}: "
+                f"expected={expected_hash}, actual={actual_hash}"
+            )
+        verified[_repo_relative(path, repo_root)] = actual_hash
     return verified
 
 
@@ -1088,6 +1138,9 @@ def summarize(
     full_manifest_path, manifest = _load_manifest(matrix)
     indexed = _validate_matrix_runs(manifest)
     source_hashes = _validate_manifest_sources(manifest, repository)
+    source_hashes.update(
+        _validate_timed_run_manifests(manifest, indexed, matrix, repository)
+    )
     timeline, risk_on_counts, session_count, config_hashes = (
         build_regime_timeline_comparison(indexed, repository)
     )

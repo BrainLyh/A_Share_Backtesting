@@ -551,7 +551,7 @@ class CompactSummaryIntegrationTests(unittest.TestCase):
             for phrase in (
                 "look-ahead",
                 "no exposure",
-                "2-6 closed trades",
+                "1-6 closed trades",
                 "post-hoc",
                 "manually supplied",
                 "no threshold optimization",
