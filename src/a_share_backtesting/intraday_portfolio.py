@@ -18,6 +18,7 @@ from .intraday_execution import (
     validate_execution_config,
 )
 from .intraday_signals import scan_intraday_b1, select_scheme_a_candidates
+from .market_regime import RISK_OFF, MarketRegimeSchedule
 from .signals import build_signals
 
 
@@ -36,11 +37,12 @@ class PortfolioResult:
     nav_daily: pd.DataFrame
     rejections: pd.DataFrame
     data_audit: pd.DataFrame
+    market_regime: pd.DataFrame
     open_positions: dict[str, Position] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "PortfolioResult":
-        return cls(*(pd.DataFrame() for _ in range(10)), open_positions={})
+        return cls(*(pd.DataFrame() for _ in range(11)), open_positions={})
 
 
 def _records(rows: list[dict[str, object]]) -> pd.DataFrame:
@@ -170,6 +172,7 @@ def run_intraday_portfolio(
     end: pd.Timestamp,
     *,
     candidate_provider: CandidateProvider | None = None,
+    market_regime: MarketRegimeSchedule | None = None,
 ) -> PortfolioResult:
     validate_execution_config(execution_config)
     start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
@@ -212,6 +215,7 @@ def run_intraday_portfolio(
         day_candidates: pd.DataFrame | None = None
         for timestamp in timestamps:
             newly_entered: set[str] = set()
+            regime_transition = market_regime.event_at(timestamp) if market_regime is not None else None
             for code in sorted(list(open_positions)):
                 raw_bar = _bar_at(minute_days.get(code, pd.DataFrame()), timestamp) if code in minute_days else None
                 if raw_bar is None:
@@ -225,6 +229,26 @@ def run_intraday_portfolio(
                     expiry_dates.get(position.position_id) == date and timestamp.strftime("%H:%M") == "15:00"
                 )
                 position_pending = pending.get(position.position_id, [])
+                if (
+                    regime_transition is not None
+                    and regime_transition.event == "down"
+                    and not any(order.reason == "market_regime_exit" for order in position_pending)
+                ):
+                    trigger_column = "close" if regime_transition.execution_mode == "same_day_1455" else "open"
+                    trigger_price = float(
+                        raw_bar.get(
+                            f"qfq_{trigger_column}",
+                            float(raw_bar[trigger_column]) * current_scale,
+                        )
+                    )
+                    position_pending = [
+                        PendingExit(
+                            "market_regime_exit",
+                            position.remaining_shares,
+                            trigger_price,
+                            timestamp,
+                        )
+                    ]
                 expiry_date = expiry_dates.get(position.position_id)
                 if (
                     expiry_date is not None
@@ -309,8 +333,21 @@ def run_intraday_portfolio(
                     if code in last_bars
                 )
                 pre_entry_nav = cash + market_value
+                regime_blocks_entries = market_regime is not None and (
+                    market_regime.state_at(timestamp) == RISK_OFF
+                    or any(
+                        order.reason == "market_regime_exit"
+                        for orders in pending.values()
+                        for order in orders
+                    )
+                )
                 for _, candidate in day_candidates.iterrows() if not day_candidates.empty else []:
                     code = str(candidate["code"]).zfill(6)
+                    if regime_blocks_entries:
+                        rejection_rows.append(
+                            {"timestamp": timestamp, "code": code, "side": "buy", "reason": "market_regime_off"}
+                        )
+                        continue
                     if code in exited_today:
                         rejection_rows.append({"timestamp": timestamp, "code": code, "side": "buy", "reason": "rearm_required"})
                         continue
@@ -448,6 +485,7 @@ def run_intraday_portfolio(
         nav_daily=nav_daily,
         rejections=_records(rejection_rows).reindex(columns=["timestamp", "code", "side", "reason"]),
         data_audit=pd.DataFrame(),
+        market_regime=market_regime.timeline.copy() if market_regime is not None else pd.DataFrame(),
         open_positions=dict(open_positions),
     )
 

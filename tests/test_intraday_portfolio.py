@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from a_share_backtesting.intraday_execution import ExecutionConfig
+from a_share_backtesting.market_regime import build_market_regime_schedule
 from a_share_backtesting.intraday_portfolio import (
     PortfolioResult,
     cached_scan_candidate_provider,
@@ -41,11 +42,17 @@ def daily_frame(code: str, dates: list[str], qfq_scales: list[float] | None = No
     return pd.DataFrame(rows)
 
 
-def minute_frame(code: str, dates: list[str], prices: dict[tuple[str, str], tuple[float, float, float, float]] | None = None) -> pd.DataFrame:
+def minute_frame(
+    code: str,
+    dates: list[str],
+    prices: dict[tuple[str, str], tuple[float, float, float, float]] | None = None,
+    times: list[str] | None = None,
+) -> pd.DataFrame:
     rows = []
     prices = prices or {}
+    times = times or ["14:40", "14:45", "14:50", "14:55", "15:00"]
     for date in dates:
-        for time in ["14:40", "14:45", "14:50", "14:55", "15:00"]:
+        for time in times:
             open_, high, low, close = prices.get((date, time), (10.0, 10.1, 9.9, 10.0))
             rows.append(
                 {
@@ -88,6 +95,283 @@ def candidates_for(day_codes: dict[str, list[str]]):
 
 
 class PortfolioChronologyTests(unittest.TestCase):
+    def test_same_day_regime_liquidates_before_ordinary_exits_and_rejects_candidates(self) -> None:
+        held_code = "600001"
+        risk_off_codes = ["600002", "600003"]
+        dates = ["2026-06-15", "2026-07-02"]
+        codes = [held_code, *risk_off_codes]
+        prices = {
+            (dates[1], "14:55"): (8.5, 12.5, 8.0, 10.3),
+        }
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_off",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": dates[0], "event": "up", "label": "activation"},
+                    {"signal_date": dates[1], "event": "down", "label": "risk_off"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {code: daily_frame(code, dates) for code in codes},
+            {
+                code: minute_frame(code, dates, prices if code == held_code else None)
+                for code in codes
+            },
+            {},
+            ExecutionConfig(),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for(
+                {dates[0]: [held_code], dates[1]: risk_off_codes}
+            ),
+            market_regime=schedule,
+        )
+
+        sells = result.fills.loc[result.fills["side"].eq("sell")]
+        self.assertEqual(sells["reason"].tolist(), ["market_regime_exit"])
+        self.assertEqual(sells.iloc[0]["timestamp"], pd.Timestamp("2026-07-02 14:55"))
+        self.assertAlmostEqual(sells.iloc[0]["adjusted_price"], 10.3 * 0.9995)
+        self.assertEqual(
+            result.candidates.loc[result.candidates["date"].eq(pd.Timestamp(dates[1])), "code"].tolist(),
+            risk_off_codes,
+        )
+        risk_off_rejections = result.rejections.loc[
+            result.rejections["reason"].eq("market_regime_off")
+        ]
+        self.assertEqual(risk_off_rejections["code"].tolist(), risk_off_codes)
+        self.assertFalse(
+            result.fills.loc[result.fills["timestamp"].eq(pd.Timestamp("2026-07-02 14:55")), "side"]
+            .eq("buy")
+            .any()
+        )
+        pd.testing.assert_frame_equal(result.market_regime, schedule.timeline)
+
+    def test_next_session_regime_uses_open_after_allowing_signal_day_entry(self) -> None:
+        held_code, blocked_code = "600001", "600002"
+        dates = ["2026-07-02", "2026-07-03"]
+        times = ["09:35", "14:40", "14:45", "14:50", "14:55", "15:00"]
+        prices = {(dates[1], "09:35"): (9.4, 10.8, 9.0, 10.6)}
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "next_session_0935",
+                "events": [
+                    {"signal_date": dates[0], "event": "down", "label": "risk_off"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {code: daily_frame(code, dates) for code in (held_code, blocked_code)},
+            {
+                held_code: minute_frame(held_code, dates, prices, times),
+                blocked_code: minute_frame(blocked_code, dates, times=times),
+            },
+            {},
+            ExecutionConfig(),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for(
+                {dates[0]: [held_code], dates[1]: [blocked_code]}
+            ),
+            market_regime=schedule,
+        )
+
+        buys = result.fills.loc[result.fills["side"].eq("buy")]
+        self.assertEqual(buys["code"].tolist(), [held_code])
+        sell = result.fills.loc[result.fills["side"].eq("sell")].iloc[0]
+        self.assertEqual(sell["timestamp"], pd.Timestamp("2026-07-03 09:35"))
+        self.assertEqual(sell["reason"], "market_regime_exit")
+        self.assertAlmostEqual(sell["adjusted_price"], 9.4 * 0.9995)
+        self.assertIn(blocked_code, result.candidates["code"].tolist())
+        self.assertIn("market_regime_off", set(result.rejections["reason"]))
+
+    def test_regime_remainder_survives_repeated_down_and_up_before_entries_resume(self) -> None:
+        held_code, candidate_code = "600001", "600002"
+        dates = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"]
+        prices = {(dates[2], "14:55"): (9.4, 11.0, 9.0, 10.6)}
+        held_minutes = minute_frame(held_code, dates, prices)
+        low_volume = (
+            (held_minutes["date"].eq(pd.Timestamp(dates[1])) & held_minutes["time"].isin(["14:55", "15:00"]))
+            | held_minutes["date"].eq(pd.Timestamp(dates[2]))
+            | (held_minutes["date"].eq(pd.Timestamp(dates[3])) & held_minutes["time"].ne("15:00"))
+        )
+        held_minutes.loc[low_volume, "volume"] = 1_000
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": dates[1], "event": "down", "label": "risk_off"},
+                    {"signal_date": dates[2], "event": "down", "label": "risk_off_confirmation"},
+                    {"signal_date": dates[3], "event": "up", "label": "risk_on"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {
+                held_code: daily_frame(held_code, dates),
+                candidate_code: daily_frame(candidate_code, dates),
+            },
+            {
+                held_code: held_minutes,
+                candidate_code: minute_frame(candidate_code, dates),
+            },
+            {},
+            ExecutionConfig(),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for(
+                {
+                    dates[0]: [held_code],
+                    dates[3]: [candidate_code],
+                    dates[4]: [candidate_code],
+                }
+            ),
+            market_regime=schedule,
+        )
+
+        repeated_down_fill = result.fills.loc[
+            result.fills["timestamp"].eq(pd.Timestamp("2026-07-03 14:55"))
+            & result.fills["side"].eq("sell")
+        ].iloc[0]
+        self.assertEqual(repeated_down_fill["reason"], "market_regime_exit")
+        self.assertAlmostEqual(repeated_down_fill["adjusted_price"], 9.4 * 0.9995)
+        candidate_buys = result.fills.loc[
+            result.fills["side"].eq("buy") & result.fills["code"].eq(candidate_code)
+        ]
+        self.assertEqual(candidate_buys["timestamp"].tolist(), [pd.Timestamp("2026-07-05 14:55")])
+        up_day_rejection = result.rejections.loc[
+            result.rejections["timestamp"].eq(pd.Timestamp("2026-07-04 14:55"))
+            & result.rejections["code"].eq(candidate_code)
+        ]
+        self.assertEqual(up_day_rejection["reason"].tolist(), ["market_regime_off"])
+
+    def test_repeated_up_confirmation_preserves_position_and_pending_exit_state(self) -> None:
+        code = "600001"
+        dates = ["2026-07-06", "2026-07-07"]
+        prices = {
+            (dates[1], "14:50"): (10.0, 11.2, 9.9, 10.6),
+            (dates[1], "14:55"): (10.4, 10.9, 10.3, 10.8),
+        }
+        minutes = minute_frame(code, dates, prices)
+        minutes.loc[
+            minutes["timestamp"].isin(
+                [pd.Timestamp("2026-07-07 14:50"), pd.Timestamp("2026-07-07 14:55")]
+            ),
+            "volume",
+        ] = 1_000
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": dates[0], "event": "up", "label": "activation"},
+                    {"signal_date": dates[1], "event": "up", "label": "confirmation"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {code: daily_frame(code, dates)},
+            {code: minutes},
+            {},
+            ExecutionConfig(horizon_days=5),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for({dates[0]: [code]}),
+            market_regime=schedule,
+        )
+
+        buy = result.fills.loc[result.fills["side"].eq("buy")].iloc[0]
+        position = result.open_positions[code]
+        self.assertEqual(position.position_id, buy["position_id"])
+        self.assertEqual(position.entry_timestamp, pd.Timestamp("2026-07-06 14:55"))
+        self.assertAlmostEqual(position.peak_adjusted_close, 10.8)
+        self.assertEqual(
+            result.fills.loc[
+                result.fills["timestamp"].eq(pd.Timestamp("2026-07-07 14:55")), "reason"
+            ].tolist(),
+            ["take_profit_10"],
+        )
+
+    def test_repeated_up_confirmation_preserves_expiry_and_holding_days(self) -> None:
+        code = "600001"
+        dates = ["2026-07-06", "2026-07-07", "2026-07-08"]
+        schedule = build_market_regime_schedule(
+            {
+                "observation_start": dates[0],
+                "initial_state": "risk_on",
+                "execution_mode": "same_day_1455",
+                "events": [
+                    {"signal_date": dates[1], "event": "up", "label": "confirmation"},
+                ],
+            },
+            pd.to_datetime(dates),
+        )
+
+        result = run_intraday_portfolio(
+            {code: daily_frame(code, dates)},
+            {code: minute_frame(code, dates)},
+            {},
+            ExecutionConfig(horizon_days=2),
+            pd.Timestamp(dates[0]),
+            pd.Timestamp(dates[-1]),
+            candidate_provider=candidates_for({dates[0]: [code]}),
+            market_regime=schedule,
+        )
+
+        trade = result.trades.iloc[0]
+        self.assertEqual(trade["exit_timestamp"], pd.Timestamp("2026-07-08 15:00"))
+        self.assertEqual(trade["exit_reason"], "expiry")
+        self.assertEqual(trade["holding_days"], 2)
+
+    def test_none_market_regime_preserves_all_legacy_frames_and_state(self) -> None:
+        frame_names = [
+            "scans", "candidates", "orders", "fills", "positions", "trades",
+            "nav_5m", "nav_daily", "rejections", "data_audit",
+        ]
+        fixtures = [
+            (["2026-07-06"], ExecutionConfig(horizon_days=5)),
+            (["2026-07-06", "2026-07-07"], ExecutionConfig(horizon_days=1)),
+        ]
+        for dates, config in fixtures:
+            with self.subTest(dates=dates):
+                code = "600001"
+                args = (
+                    {code: daily_frame(code, dates)},
+                    {code: minute_frame(code, dates)},
+                    {},
+                    config,
+                    pd.Timestamp(dates[0]),
+                    pd.Timestamp(dates[-1]),
+                )
+                provider = candidates_for({dates[0]: [code]})
+                omitted = run_intraday_portfolio(*args, candidate_provider=provider)
+                explicit_none = run_intraday_portfolio(
+                    *args, candidate_provider=provider, market_regime=None
+                )
+
+                for frame_name in frame_names:
+                    pd.testing.assert_frame_equal(
+                        getattr(omitted, frame_name), getattr(explicit_none, frame_name)
+                    )
+                self.assertEqual(omitted.open_positions, explicit_none.open_positions)
+                self.assertTrue(omitted.market_regime.empty)
+                self.assertTrue(explicit_none.market_regime.empty)
+
     def test_runtime_rejects_strategy_hard_limit_violations(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_positions"):
             run_intraday_portfolio(
