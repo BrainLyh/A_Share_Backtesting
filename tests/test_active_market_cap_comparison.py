@@ -540,11 +540,9 @@ def prepare_frozen_repo(root: Path) -> None:
                     "minute_source_sha256": minute_hash,
                     "git_revision": "baseline-revision",
                     "git_dirty": False,
-                    "execution_config": {
-                        "target_fraction": driver.POSITION_CONFIGS[
-                            job.position
-                        ].target_fraction,
-                    },
+                    "execution_config": driver._expected_execution_config(
+                        job, root
+                    ),
                 }
             ),
         )
@@ -569,9 +567,7 @@ def valid_manifest(job: driver.MatrixRun, repo_root: Path) -> dict[str, object]:
         "config_sha256": _file_sha256(config),
         "scan_source": str(scan.resolve()),
         "scan_source_sha256": _file_sha256(scan),
-        "execution_config": {
-            "target_fraction": driver.POSITION_CONFIGS[job.position].target_fraction,
-        },
+        "execution_config": driver._expected_execution_config(job, repo_root),
         "market_regime_source": str(regime.resolve()),
         "market_regime_source_sha256": _file_sha256(regime),
         "minute_source_sha256": baseline_manifest["minute_source_sha256"],
@@ -801,6 +797,31 @@ class ArtifactReconciliationTests(unittest.TestCase):
                 with self.assertRaisesRegex(driver.ReconciliationError, field):
                     driver.reconcile_frames(frames)
 
+    def test_all_trade_summary_fields_are_recomputed(self) -> None:
+        fields = [
+            "mean_net_return",
+            "median_net_return",
+            "payoff_ratio",
+            "expectancy",
+            "average_holding_days",
+            "maximum_consecutive_losses",
+            "take_profit_trade_rate",
+            "stop_exit_rate",
+            "residual_exit_rate",
+            "expiry_exit_rate",
+            "overtime_exit_rate",
+            "mean_maximum_adverse_excursion",
+            "worst_maximum_adverse_excursion",
+        ]
+        for field in fields:
+            with self.subTest(field=field):
+                frames = valid_frames()
+                frames["trade_summary.csv"].loc[0, field] = 1.0
+                with self.assertRaisesRegex(
+                    driver.ReconciliationError, f"trade_summary.csv {field} mismatch"
+                ):
+                    driver.reconcile_frames(frames)
+
     def test_all_non_profit_factor_economic_inputs_reject_infinity(self) -> None:
         cases = (
             ("nav_daily.csv", "nav"),
@@ -866,6 +887,12 @@ class ArtifactReconciliationTests(unittest.TestCase):
             with self.assertRaisesRegex(driver.ReconciliationError, "target fraction"):
                 driver.parse_run_artifacts(run_dir, job, repo_root)
 
+            bad = json.loads(json.dumps(manifest))
+            bad["execution_config"]["horizon_days"] = 6
+            write_run_artifacts(run_dir, valid_frames(), bad)
+            with self.assertRaisesRegex(driver.ReconciliationError, "execution config"):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
             missing_minute_hash = dict(manifest)
             missing_minute_hash.pop("minute_source_sha256")
             write_run_artifacts(run_dir, valid_frames(), missing_minute_hash)
@@ -910,6 +937,15 @@ class ArtifactReconciliationTests(unittest.TestCase):
             baseline_path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaisesRegex(
                 driver.ReconciliationError, "frozen baseline run_manifest.json"
+            ):
+                driver.parse_run_artifacts(run_dir, job, repo_root)
+
+            bad = json.loads(json.dumps(original))
+            bad["execution_config"]["horizon_days"] = 6
+            baseline_path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaisesRegex(
+                driver.ReconciliationError,
+                "frozen baseline run_manifest.json execution config",
             ):
                 driver.parse_run_artifacts(run_dir, job, repo_root)
 

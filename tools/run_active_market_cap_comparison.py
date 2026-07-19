@@ -14,6 +14,7 @@ import pandas as pd
 from a_share_backtesting.intraday_portfolio_run import (
     EMPTY_CSV_COLUMNS,
     REQUIRED_OUTPUTS as CLI_REQUIRED_OUTPUTS,
+    _execution_config as build_execution_config,
     main as intraday_cli_main,
 )
 from a_share_backtesting.market_regime import (
@@ -566,6 +567,51 @@ def _validate_manifest_target(
         )
 
 
+def _expected_execution_config(job: MatrixRun, repo_root: Path) -> dict[str, object]:
+    path = repo_root / job.config
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise ReconciliationError(
+            f"cannot parse frozen execution config {path}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise ReconciliationError(f"frozen execution config must be an object: {path}")
+    return dict(build_execution_config(payload).__dict__)
+
+
+def _validate_manifest_execution_config(
+    manifest: Mapping[str, object],
+    expected: Mapping[str, object],
+    *,
+    artifact: str,
+) -> None:
+    actual = manifest.get("execution_config")
+    if not isinstance(actual, Mapping) or set(actual) != set(expected):
+        raise ReconciliationError(f"{artifact} execution config mismatch")
+    for field, expected_value in expected.items():
+        actual_value = actual.get(field)
+        if isinstance(expected_value, (int, float)) and not isinstance(
+            expected_value, bool
+        ):
+            try:
+                matches = math.isclose(
+                    float(actual_value),
+                    float(expected_value),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = actual_value == expected_value
+        if not matches:
+            raise ReconciliationError(
+                f"{artifact} execution config mismatch for {field}: "
+                f"{actual_value!r} != {expected_value!r}"
+            )
+
+
 def _validate_clean_revision(
     manifest: Mapping[str, object], *, artifact: str
 ) -> None:
@@ -619,9 +665,15 @@ def _validate_run_manifest(
             artifact=baseline_artifact,
         )
     expected_target = POSITION_CONFIGS[job.position].target_fraction
+    expected_execution = _expected_execution_config(job, repo_root)
     _validate_manifest_target(
         baseline_manifest,
         expected_target,
+        artifact=baseline_artifact,
+    )
+    _validate_manifest_execution_config(
+        baseline_manifest,
+        expected_execution,
         artifact=baseline_artifact,
     )
     _validate_clean_revision(baseline_manifest, artifact=baseline_artifact)
@@ -644,6 +696,11 @@ def _validate_run_manifest(
     _validate_manifest_target(
         manifest,
         expected_target,
+        artifact="run_manifest.json",
+    )
+    _validate_manifest_execution_config(
+        manifest,
+        expected_execution,
         artifact="run_manifest.json",
     )
     _validate_clean_revision(manifest, artifact="run_manifest.json")
@@ -899,26 +956,23 @@ def reconcile_trade_economics(frames: Mapping[str, pd.DataFrame]) -> pd.DataFram
             frames["positions.csv"],
             nav["timestamp"].max(),
         )
-        metrics = reconciled_trade_metrics(reconciled)
+        metrics = _recomputed_trade_summary(
+            reconciled,
+            frames["trades.csv"],
+            frames["fills.csv"],
+        )
     except TradeEconomicsError as error:
         raise ReconciliationError(str(error)) from error
 
     summary = frames["trade_summary.csv"]
     if len(summary) != 1:
         raise ReconciliationError("trade_summary.csv must contain exactly one row")
-    for field in ("closed_trade_count", "open_trade_count"):
-        try:
-            reported = int(summary.iloc[0][field])
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ReconciliationError(f"trade_summary.csv has invalid {field}") from error
-        if reported != metrics[field]:
-            raise ReconciliationError(f"trade_summary.csv {field} mismatch")
-    for field in ("win_rate", "profit_factor"):
+    for field in CSV_SCHEMAS["trade_summary.csv"]:
         try:
             reported = float(summary.iloc[0][field])
-        except (TypeError, ValueError) as error:
+            expected = float(metrics[field])
+        except (TypeError, ValueError, OverflowError, KeyError) as error:
             raise ReconciliationError(f"trade_summary.csv has invalid {field}") from error
-        expected = float(metrics[field])
         matches = (
             math.isnan(reported) and math.isnan(expected)
         ) or (
@@ -931,6 +985,106 @@ def reconcile_trade_economics(frames: Mapping[str, pd.DataFrame]) -> pd.DataFram
         if not matches:
             raise ReconciliationError(f"trade_summary.csv {field} mismatch")
     return reconciled
+
+
+def _recomputed_trade_summary(
+    reconciled: pd.DataFrame,
+    trades: pd.DataFrame,
+    fills: pd.DataFrame,
+) -> dict[str, float | int]:
+    metrics = reconciled_trade_metrics(reconciled)
+    closed = reconciled.loc[reconciled["status"].eq("closed")].copy()
+    details = trades.copy()
+    if not details.empty:
+        details["position_id"] = details["position_id"].astype(str)
+        details = details.set_index("position_id")
+    if not closed.empty:
+        closed["holding_days"] = [
+            float(details.loc[str(position_id), "holding_days"])
+            for position_id in closed["position_id"]
+        ]
+        closed["maximum_adverse_excursion"] = [
+            float(details.loc[str(position_id), "maximum_adverse_excursion"])
+            for position_id in closed["position_id"]
+        ]
+
+    wins = closed.loc[closed["net_pnl"] > 0.0, "net_pnl"]
+    losses = closed.loc[closed["net_pnl"] < 0.0, "net_pnl"]
+    ordered = closed.sort_values("entry_timestamp")
+    maximum_consecutive_losses = 0
+    current_loss_run = 0
+    for is_loss in ordered["net_pnl"].lt(0):
+        current_loss_run = current_loss_run + 1 if is_loss else 0
+        maximum_consecutive_losses = max(
+            maximum_consecutive_losses, current_loss_run
+        )
+
+    fill_ids = set(
+        fills.loc[
+            fills["reason"].astype(str).str.startswith("take_profit_"),
+            "position_id",
+        ].astype(str)
+    )
+    closed_ids = set(closed["position_id"].astype(str))
+    exit_reason = closed["exit_reason"].astype(str)
+    mae = pd.to_numeric(
+        closed.get("maximum_adverse_excursion", pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    return {
+        **metrics,
+        "mean_net_return": (
+            float(closed["net_return"].mean()) if not closed.empty else float("nan")
+        ),
+        "median_net_return": (
+            float(closed["net_return"].median()) if not closed.empty else float("nan")
+        ),
+        "payoff_ratio": (
+            float(wins.mean() / abs(losses.mean()))
+            if not wins.empty and not losses.empty
+            else float("nan")
+        ),
+        "expectancy": (
+            float(closed["net_pnl"].mean()) if not closed.empty else float("nan")
+        ),
+        "average_holding_days": (
+            float(closed["holding_days"].mean())
+            if not closed.empty
+            else float("nan")
+        ),
+        "maximum_consecutive_losses": maximum_consecutive_losses,
+        "take_profit_trade_rate": (
+            float(len(fill_ids & closed_ids) / len(closed))
+            if not closed.empty
+            else float("nan")
+        ),
+        "stop_exit_rate": (
+            float(exit_reason.eq("stop_loss").mean())
+            if not closed.empty
+            else float("nan")
+        ),
+        "residual_exit_rate": (
+            float(exit_reason.eq("residual_drawdown").mean())
+            if not closed.empty
+            else float("nan")
+        ),
+        "expiry_exit_rate": (
+            float(exit_reason.eq("expiry").mean())
+            if not closed.empty
+            else float("nan")
+        ),
+        "overtime_exit_rate": (
+            float(exit_reason.eq("overtime_exit").mean())
+            if not closed.empty
+            else float("nan")
+        ),
+        "mean_maximum_adverse_excursion": (
+            float(mae.mean()) if not mae.empty else float("nan")
+        ),
+        "worst_maximum_adverse_excursion": (
+            float(mae.min()) if not mae.empty else float("nan")
+        ),
+    }
 
 
 def reconcile_position_constraints(frames: Mapping[str, pd.DataFrame]) -> None:
