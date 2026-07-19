@@ -3,6 +3,8 @@
   "observation_start": "2026-06-01",
   "initial_state": "risk_off",
   "execution_mode": "next_session_0935",
+  "calendar_extension_dates": ["2026-07-20"],
+  "calendar_extension_source": "https://www.sse.com.cn/disclosure/dealinstruc/closed/c/c_20251222_10802510.shtml",
   "events": [
     {"signal_date": "2026-06-08", "event": "down", "label": "single_day_0amv_fall_at_least_3pct"},
     {"signal_date": "2026-06-15", "event": "up", "label": "two_session_0amv_cumulative_rise_at_least_4pct"},

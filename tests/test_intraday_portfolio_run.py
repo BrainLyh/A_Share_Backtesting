@@ -1,4 +1,5 @@
 import json
+import hashlib
 import struct
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ import pandas as pd
 
 from a_share_backtesting.intraday_portfolio_run import (
     REQUIRED_OUTPUTS,
+    _build_cli_market_regime,
     _execution_config,
     _load_minutes,
     _load_qfq,
@@ -36,27 +38,29 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         self.config_path = self.root / "config.json"
         self.output = self.root / "output"
 
-    def write_inputs(self) -> None:
-        date = pd.Timestamp("2026-07-17")
+    def write_inputs(self, minute_dates: tuple[str, ...] = ("2026-07-17",)) -> None:
+        dates = [pd.Timestamp(value) for value in minute_dates]
+        date = max(dates)
         lc5 = self.minute_root / "sh" / "fzline" / "sh600001.lc5"
         lc5.parent.mkdir(parents=True)
         records = []
-        for time in trading_times():
-            hour, minute = (int(part) for part in time.split(":"))
-            records.append(
-                struct.pack(
-                    "<HHfffffII",
-                    encoded_date(date),
-                    hour * 60 + minute,
-                    10.0,
-                    10.1,
-                    9.9,
-                    10.0,
-                    1_000_000.0,
-                    100_000,
-                    0,
+        for minute_date in dates:
+            for time in trading_times():
+                hour, minute = (int(part) for part in time.split(":"))
+                records.append(
+                    struct.pack(
+                        "<HHfffffII",
+                        encoded_date(minute_date),
+                        hour * 60 + minute,
+                        10.0,
+                        10.1,
+                        9.9,
+                        10.0,
+                        1_000_000.0,
+                        100_000,
+                        0,
+                    )
                 )
-            )
         lc5.write_bytes(b"".join(records))
         daily_rows = []
         for daily_date in pd.bdate_range(end=date, periods=60):
@@ -248,6 +252,190 @@ class IntradayPortfolioCliTests(unittest.TestCase):
         self.assertIn("retrospective_stock_pool_snapshot", manifest["limitations"])
         self.assertIn("historical_st_status_unavailable", manifest["limitations"])
         self.assertIsInstance(manifest["git_dirty"], bool)
+        self.assertFalse((self.output / "market_regime.csv").exists())
+        self.assertNotIn("market_regime_source", manifest)
+        self.assertNotIn("market_regime_source_sha256", manifest)
+        self.assertNotIn("outputs", manifest)
+        report = (self.output / "report.md").read_text(encoding="utf-8")
+        self.assertNotIn("Market-regime dates were manually supplied.", report)
+        self.assertNotIn("Market-regime thresholds are post-hoc.", report)
+        self.assertNotIn("same_day_1455", report)
+
+    def test_cli_writes_conditional_market_regime_artifact_and_provenance(self) -> None:
+        self.write_inputs(("2026-07-16", "2026-07-17"))
+        scan_path = self.root / "scans.csv"
+        pd.DataFrame(
+            [
+                {
+                    "date": date,
+                    "code": "600001",
+                    "scan_time": time,
+                    "b1_signal": True,
+                    "signal_strength": 5.0,
+                    "atr14": 0.5,
+                }
+                for date in ("2026-07-16", "2026-07-17")
+                for time in ("14:40", "14:45", "14:50")
+            ]
+        ).to_csv(scan_path, index=False)
+        regime_path = self.root / "market_regime.json"
+        regime_path.write_text(
+            json.dumps(
+                {
+                    "observation_start": "2026-07-16",
+                    "initial_state": "risk_on",
+                    "execution_mode": "next_session_0935",
+                    "events": [
+                        {"signal_date": "2026-07-16", "event": "down", "label": "risk_off"},
+                        {"signal_date": "2026-07-17", "event": "down", "label": "terminal_risk_off"},
+                    ],
+                    "calendar_extension_dates": ["2026-07-20"],
+                    "calendar_extension_source": "https://example.test/exchange-calendar",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code = main(
+            [
+                "--minute-root",
+                str(self.minute_root),
+                "--qfq-source",
+                str(self.qfq_path),
+                "--stock-pool",
+                str(self.pool_path),
+                "--config",
+                str(self.config_path),
+                "--scan-source",
+                str(scan_path),
+                "--market-regime",
+                str(regime_path),
+                "--output",
+                str(self.output),
+                "--analysis-start",
+                "2026-07-16",
+                "--analysis-end",
+                "2026-07-17",
+            ]
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            set(REQUIRED_OUTPUTS) | {"market_regime.csv"},
+            {path.name for path in self.output.iterdir()},
+        )
+        timeline = pd.read_csv(self.output / "market_regime.csv")
+        self.assertEqual(
+            timeline.columns.tolist(),
+            [
+                "signal_date",
+                "effective_timestamp",
+                "event",
+                "label",
+                "prior_state",
+                "resulting_state",
+                "execution_mode",
+            ],
+        )
+        self.assertEqual(
+            timeline.to_dict("records"),
+            [
+                {
+                    "signal_date": "2026-07-16",
+                    "effective_timestamp": "2026-07-17 09:35:00",
+                    "event": "down",
+                    "label": "risk_off",
+                    "prior_state": "risk_on",
+                    "resulting_state": "risk_off",
+                    "execution_mode": "next_session_0935",
+                },
+                {
+                    "signal_date": "2026-07-17",
+                    "effective_timestamp": "2026-07-20 09:35:00",
+                    "event": "down",
+                    "label": "terminal_risk_off",
+                    "prior_state": "risk_off",
+                    "resulting_state": "risk_off",
+                    "execution_mode": "next_session_0935",
+                },
+            ],
+        )
+        self.assertIn("market_regime_exit", set(pd.read_csv(self.output / "fills.csv")["reason"]))
+        self.assertIn("market_regime_exit", set(pd.read_csv(self.output / "trades.csv")["exit_reason"]))
+        self.assertIn("market_regime_off", set(pd.read_csv(self.output / "rejections.csv")["reason"]))
+        nav_dates = pd.to_datetime(pd.read_csv(self.output / "nav_5m.csv")["date"])
+        fill_times = pd.to_datetime(pd.read_csv(self.output / "fills.csv")["timestamp"])
+        self.assertLessEqual(nav_dates.max(), pd.Timestamp("2026-07-17"))
+        self.assertLessEqual(fill_times.max(), pd.Timestamp("2026-07-17 15:00"))
+        manifest = json.loads((self.output / "run_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["market_regime_source"], str(regime_path.resolve()))
+        self.assertEqual(
+            manifest["market_regime_source_sha256"],
+            hashlib.sha256(regime_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(manifest["outputs"], [*REQUIRED_OUTPUTS, "market_regime.csv"])
+        report = (self.output / "report.md").read_text(encoding="utf-8")
+        self.assertIn("Market-regime dates were manually supplied.", report)
+        self.assertIn("Market-regime thresholds are post-hoc.", report)
+        self.assertIn("`same_day_1455` assumes the full signal is observable by 14:55.", report)
+
+    def test_market_regime_calendar_extensions_are_explicitly_validated(self) -> None:
+        minutes = {"600001": pd.DataFrame({"date": [pd.Timestamp("2026-07-17")]})}
+        base = {
+            "observation_start": "2026-07-17",
+            "initial_state": "risk_off",
+            "execution_mode": "next_session_0935",
+            "events": [
+                {"signal_date": "2026-07-17", "event": "down", "label": "terminal_risk_off"}
+            ],
+        }
+        invalid_cases = [
+            (
+                {"calendar_extension_dates": "2026-07-20", "calendar_extension_source": "https://example.test"},
+                "calendar_extension_dates must be a non-empty list",
+            ),
+            (
+                {"calendar_extension_dates": ["07/20/2026"], "calendar_extension_source": "https://example.test"},
+                "calendar_extension_dates entries must be ISO dates",
+            ),
+            (
+                {
+                    "calendar_extension_dates": ["2026-07-20", "2026-07-20"],
+                    "calendar_extension_source": "https://example.test",
+                },
+                "calendar_extension_dates must not contain duplicates",
+            ),
+            (
+                {"calendar_extension_dates": ["2026-07-20"]},
+                "calendar_extension_source must be a non-empty string",
+            ),
+            (
+                {"calendar_extension_dates": ["2026-07-20"], "calendar_extension_source": "  "},
+                "calendar_extension_source must be a non-empty string",
+            ),
+            (
+                {"calendar_extension_source": "https://example.test"},
+                "calendar_extension_source requires calendar_extension_dates",
+            ),
+            (
+                {
+                    "execution_mode": "same_day_1455",
+                    "calendar_extension_dates": ["2026-07-20"],
+                    "calendar_extension_source": "https://example.test",
+                },
+                "calendar extensions require next_session_0935 execution",
+            ),
+            (
+                {"calendar_extension_dates": ["2026-07-17"], "calendar_extension_source": "https://example.test"},
+                "calendar extension dates must follow in-window minute trading dates",
+            ),
+        ]
+        for index, (updates, message) in enumerate(invalid_cases):
+            with self.subTest(index=index):
+                path = self.root / f"invalid_regime_{index}.json"
+                path.write_text(json.dumps({**base, **updates}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    _build_cli_market_regime(path, minutes)
 
     def test_cli_accepts_frozen_scan_source(self) -> None:
         self.write_inputs()

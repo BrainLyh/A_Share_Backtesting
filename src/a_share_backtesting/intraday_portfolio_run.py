@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pandas as pd
 
 from .intraday_execution import ExecutionConfig, validate_execution_config
 from .intraday_portfolio import cached_scan_candidate_provider, run_intraday_portfolio, summarize_portfolio
+from .market_regime import MarketRegimeSchedule, build_market_regime_schedule, load_market_regime_config
 from .tdx_lc5 import audit_lc5_records, find_lc5_path, read_tdx_lc5_file
 
 
@@ -65,6 +67,7 @@ LIMITATIONS = [
     "five_minute_intrabar_order_unknown_stop_first",
     "order_book_queue_unavailable",
 ]
+_ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -74,6 +77,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--stock-pool", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--scan-source")
+    parser.add_argument("--market-regime")
     parser.add_argument("--output", required=True)
     parser.add_argument("--analysis-start", required=True)
     parser.add_argument("--analysis-end", required=True)
@@ -261,8 +265,22 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def _report(portfolio: pd.DataFrame, trade: pd.DataFrame, audit_count: int) -> str:
+def _report(
+    portfolio: pd.DataFrame,
+    trade: pd.DataFrame,
+    audit_count: int,
+    market_regime: bool = False,
+) -> str:
     row, trade_row = portfolio.iloc[0], trade.iloc[0]
+    limitations = [f"- {item}" for item in LIMITATIONS]
+    if market_regime:
+        limitations.extend(
+            [
+                "- Market-regime dates were manually supplied.",
+                "- Market-regime thresholds are post-hoc.",
+                "- `same_day_1455` assumes the full signal is observable by 14:55.",
+            ]
+        )
     return "\n".join(
         [
             "# Intraday B1 Portfolio Backtest",
@@ -276,10 +294,53 @@ def _report(portfolio: pd.DataFrame, trade: pd.DataFrame, audit_count: int) -> s
             "",
             "## Limitations",
             "",
-            *[f"- {item}" for item in LIMITATIONS],
+            *limitations,
             "",
         ]
     )
+
+
+def _build_cli_market_regime(
+    path: Path | None,
+    minutes: dict[str, pd.DataFrame],
+) -> MarketRegimeSchedule | None:
+    if path is None:
+        return None
+    config = load_market_regime_config(path)
+    trading_dates = sorted(
+        {
+            pd.Timestamp(date).normalize()
+            for frame in minutes.values()
+            for date in frame["date"].unique()
+        }
+    )
+    raw_extensions = config.get("calendar_extension_dates")
+    has_extension_source = "calendar_extension_source" in config
+    if raw_extensions is None:
+        if has_extension_source:
+            raise ValueError("calendar_extension_source requires calendar_extension_dates")
+    else:
+        if config.get("execution_mode") != "next_session_0935":
+            raise ValueError("calendar extensions require next_session_0935 execution")
+        if not isinstance(raw_extensions, list) or not raw_extensions:
+            raise ValueError("calendar_extension_dates must be a non-empty list")
+        extension_source = config.get("calendar_extension_source")
+        if not isinstance(extension_source, str) or not extension_source.strip():
+            raise ValueError("calendar_extension_source must be a non-empty string")
+        extensions: list[pd.Timestamp] = []
+        for value in raw_extensions:
+            if not isinstance(value, str) or not _ISO_DATE_PATTERN.fullmatch(value):
+                raise ValueError("calendar_extension_dates entries must be ISO dates (YYYY-MM-DD)")
+            try:
+                extensions.append(pd.Timestamp(value).normalize())
+            except (TypeError, ValueError) as error:
+                raise ValueError("calendar_extension_dates entries must be ISO dates (YYYY-MM-DD)") from error
+        if len(set(extensions)) != len(extensions):
+            raise ValueError("calendar_extension_dates must not contain duplicates")
+        if not trading_dates or any(date <= trading_dates[-1] for date in extensions):
+            raise ValueError("calendar extension dates must follow in-window minute trading dates")
+        trading_dates.extend(extensions)
+    return build_market_regime_schedule(config, trading_dates)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -289,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     pool_path = Path(args.stock_pool)
     config_path = Path(args.config)
     scan_source = Path(args.scan_source) if args.scan_source else None
+    market_regime_path = Path(args.market_regime) if args.market_regime else None
     output = Path(args.output)
     start, end = pd.Timestamp(args.analysis_start).normalize(), pd.Timestamp(args.analysis_end).normalize()
     if start > end:
@@ -298,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     config["stock_pool_codes"] = codes
     daily = _load_qfq(qfq_source, set(codes), start, end)
     minutes, data_audit, minute_paths = _load_minutes(minute_root, codes, daily, start, end)
+    market_regime = _build_cli_market_regime(market_regime_path, minutes)
     execution = _execution_config(config)
     cached_scans = None
     candidate_provider = None
@@ -314,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         start,
         end,
         candidate_provider=candidate_provider,
+        market_regime=market_regime,
     )
     if cached_scans is not None:
         result.scans = cached_scans
@@ -336,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
         "trade_summary.csv": trade_summary,
         "comparison.csv": comparison,
     }
+    if market_regime is not None:
+        frames["market_regime.csv"] = result.market_regime
     for filename, frame in frames.items():
         if frame.empty and len(frame.columns) == 0 and filename in EMPTY_CSV_COLUMNS:
             frame = pd.DataFrame(columns=EMPTY_CSV_COLUMNS[filename])
@@ -364,8 +430,19 @@ def main(argv: list[str] | None = None) -> int:
         "execution_config": execution.__dict__,
         "limitations": LIMITATIONS,
     }
+    if market_regime_path is not None:
+        manifest.update(
+            {
+                "market_regime_source": str(market_regime_path.resolve()),
+                "market_regime_source_sha256": _sha256_file(market_regime_path),
+                "outputs": [*REQUIRED_OUTPUTS, "market_regime.csv"],
+            }
+        )
     (output / "run_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    (output / "report.md").write_text(_report(portfolio_summary, trade_summary, len(data_audit)), encoding="utf-8")
+    (output / "report.md").write_text(
+        _report(portfolio_summary, trade_summary, len(data_audit), market_regime=market_regime is not None),
+        encoding="utf-8",
+    )
     return 0
 
 

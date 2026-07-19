@@ -61,6 +61,16 @@ $env:PYTHONPATH = "$PWD\src"
   --analysis-end 2026-07-17
 ```
 
+Pass `--market-regime <config.json>` to apply an optional market-wide timing
+schedule. Timed runs add `market_regime.csv` and record the resolved schedule
+path and SHA-256 in `run_manifest.json`; untimed runs retain the artifact and
+manifest contract shown above. `calendar_extension_dates` in a next-session
+schedule are audit-only trading dates: they can resolve terminal transitions
+after `analysis_end`, but do not add bars, NAV rows, fills, or analysis days.
+
+Market-regime dates are manually supplied and their thresholds are post-hoc.
+The `same_day_1455` mode assumes the full signal is observable by 14:55.
+
 `config/intraday_portfolio_20260718.json` 是每只股票目标净值 1/3 的原始确认版；`config/intraday_portfolio_risk_controlled_20260718.json` 保持最多三只股票，但把单票目标降为净值 1/4。后者只降低资金风险，不代表信号胜率已经改善。
 
 参数敏感性复跑可通过 `--scan-source <prior-run>/signal_scans.csv` 复用冻结的逐时点信号。该模式仍会根据新账本的实际持仓重新执行首次触发、持仓去重、候选排序和容量约束，不能用 `candidates.csv` 代替。
