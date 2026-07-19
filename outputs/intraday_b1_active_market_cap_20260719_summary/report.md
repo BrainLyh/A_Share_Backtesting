@@ -43,7 +43,7 @@ All 4 innovative-drug timed rows have zero closed and open trades. Their 0% retu
 
 ## Sample size
 
-12 timed rows have only 2-6 closed trades. Win rates and profit factors are reported with their closed-trade denominators and are too thin for stable inference.
+12 timed rows have only 1-6 closed trades. Win rates and profit factors are reported with their closed-trade denominators and are too thin for stable inference.
 - ai_semiconductor / canonical / same_day_1455: 6 closed, 0 open.
 - ai_semiconductor / canonical / next_session_0935: 5 closed, 0 open.
 - ai_semiconductor / risk025 / same_day_1455: 6 closed, 0 open.
