@@ -137,6 +137,8 @@ Expected: all chronology, accounting, metric, and regime tests pass.
 - Modify: `src/a_share_backtesting/intraday_portfolio_run.py`
 - Modify: `tests/test_intraday_portfolio_run.py`
 - Modify: `README.md`
+- Modify: `config/active_market_cap_single_day_4pct_next_session_20260719.json`
+- Modify: `config/active_market_cap_two_day_4pct_next_session_20260719.json`
 
 - [ ] **Step 1: Write failing timed CLI test**
 
@@ -147,6 +149,8 @@ Pass `--market-regime <config>` to the existing synthetic end-to-end fixture. As
 Run: `python -m unittest tests.test_intraday_portfolio_run -v`
 
 Build the schedule from actual in-window minute trading dates. Add `market_regime.csv` only when the argument is supplied, append it to the timed run's manifest outputs, and include the schedule in the runner call.
+
+For next-session configurations, merge validated `calendar_extension_dates` into the scheduling calendar. The supplied configs must add 2026-07-20 with the official SSE 2026 closure-calendar source so the terminal 2026-07-17 observation remains auditable outside the return window. Calendar extensions affect only schedule construction and must never add NAV timestamps, bars, fills, or analysis days.
 
 - [ ] **Step 3: Guard the untimed output contract**
 
@@ -252,7 +256,8 @@ Confirm no raw Tongdaxin/qfq data, large full ledgers, stale outputs, unrelated 
 - [ ] **Step 4: Commit implementation and research artifacts**
 
 ```powershell
-git add src tests tools config docs README.md DEVELOPMENT_STATUS.md outputs/intraday_b1_active_market_cap_20260719_summary
+git add src tests tools config docs README.md DEVELOPMENT_STATUS.md
+git add -f outputs/intraday_b1_active_market_cap_20260719_summary
 git commit -m "feat: add active market cap timing overlay"
 ```
 

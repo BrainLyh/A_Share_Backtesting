@@ -67,6 +67,8 @@ Because a full-day 0AMV change may only be known after the close, also run `next
 
 This control quantifies possible look-ahead advantage in same-day execution. The requested same-day result remains primary, but both results must be reported together.
 
+The sample ends on 2026-07-17, so that date's down observation becomes effective outside the return window on 2026-07-20. The two next-session configurations explicitly carry `calendar_extension_dates` with 2026-07-20 and the official SSE 2026 closure-calendar source. This extension is used only to retain the terminal event in the audit timeline; it does not load future prices, create a fill, or extend the portfolio measurement window.
+
 ## Interaction With Existing Rules
 
 - A-share T+1 remains mandatory. The supplied up and down events do not occur on the same date, so the primary schedule does not require an entry-day sell.
@@ -85,6 +87,7 @@ Add a dated timing configuration containing:
 - up-event dates and optional confirmation labels;
 - down-event dates;
 - execution timing mode.
+- optional calendar-extension dates and their authoritative source when a terminal observation becomes effective after the available price window.
 
 The portfolio runner accepts an optional regime schedule. Existing runs without a schedule remain byte-for-byte behaviorally unchanged.
 
